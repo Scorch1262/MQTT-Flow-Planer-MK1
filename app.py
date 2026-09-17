@@ -35,7 +35,7 @@ Erreichbar unter:      http://<IP-DES-PCS>:8020  (im gesamten LAN)
 #   PATCH (x.x.+1) -> Bugfix, keine neuen Funktionen
 #   MINOR (x.+1.0) -> neue Funktion, abwaertskompatibel
 #   MAJOR (+1.0.0) -> Breaking Change (z. B. Config-Format aendert sich)
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 import os
 import sys

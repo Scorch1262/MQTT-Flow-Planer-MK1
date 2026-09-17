@@ -50,8 +50,12 @@ jobs:
           pip install pyinstaller
 
       - name: EXE bauen
+        # Bewusst OHNE --noconsole: das Programm soll immer mit einem
+        # sichtbaren Konsolenfenster starten, damit es sich per
+        # Fenster-schliessen oder STRG+C jederzeit leicht wieder
+        # beenden laesst (statt unsichtbar im Hintergrund zu laufen).
         run: >
-          pyinstaller --onefile --noconsole
+          pyinstaller --onefile --console
           --name "MQTT-Ablaufplaner"
           app.py
 
@@ -67,9 +71,14 @@ jobs:
           path: out/*.exe
 
   # ------------------------------------------------------------------
-  # macOS (Apple Silicon / arm64): .app-Bundle per PyInstaller
+  # macOS (Apple Silicon / arm64) per PyInstaller.
   # Der Runner "macos-14" ist ein nativer Apple-Silicon-Runner, das
-  # Ergebnis ist somit eine native arm64-App (kein Rosetta noetig).
+  # Ergebnis ist somit eine native arm64-Binary (kein Rosetta noetig).
+  # Bewusst KEIN --windowed/.app-Bundle: stattdessen eine einfache
+  # Kommandozeilen-Binary plus ein .command-Startskript, das beim
+  # Doppelklick im Finder automatisch ein Terminal-Fenster oeffnet -
+  # darin laeuft das Programm sichtbar und laesst sich durch Schliessen
+  # des Terminal-Fensters (oder STRG+C) jederzeit leicht beenden.
   # ------------------------------------------------------------------
   build-macos:
     needs: read-version
@@ -87,18 +96,28 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: App bauen
+      - name: Binary bauen
         run: >
-          pyinstaller --windowed
+          pyinstaller --onefile
           --name "MQTT-Ablaufplaner"
           --target-arch arm64
           app.py
 
-      - name: App als ZIP verpacken (mit Versionsnummer)
+      - name: Terminal-Startskript hinzufuegen und als ZIP verpacken
         run: |
           mkdir -p out
+          cat > "dist/Start-MQTT-Ablaufplaner.command" <<'EOF'
+          #!/bin/bash
+          # Oeffnet sich per Doppelklick im Finder automatisch in einem
+          # Terminal-Fenster. Zum Beenden einfach dieses Fenster schliessen
+          # (und mit "Beenden" bestaetigen) oder STRG+C druecken.
+          cd "$(dirname "$0")"
+          ./MQTT-Ablaufplaner
+          EOF
+          chmod +x "dist/Start-MQTT-Ablaufplaner.command" "dist/MQTT-Ablaufplaner"
           cd dist
-          zip -ry "../out/MQTT-Ablaufplaner-v${{ needs.read-version.outputs.version }}-macos-arm64.zip" "MQTT-Ablaufplaner.app"
+          zip -ry "../out/MQTT-Ablaufplaner-v${{ needs.read-version.outputs.version }}-macos-arm64.zip" \
+            "MQTT-Ablaufplaner" "Start-MQTT-Ablaufplaner.command"
 
       - uses: actions/upload-artifact@v4
         with:

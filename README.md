@@ -5,7 +5,7 @@ Blockschaltbild zu entwerfen - Bloecke werden per Klick auf die
 Zeichenflaeche gelegt, per Drag & Drop positioniert und durch Linien zu
 einem Ablauf verschaltet (aehnlich Node-RED).
 
-**Aktuelle Version: v1.0.0**
+**Aktuelle Version: v1.1.0**
 
 ## Bloecke
 
@@ -57,12 +57,30 @@ Der Workflow unter `.github/workflows/build.yml` startet danach
 automatisch bei jedem Push auf `main` (und kann zusaetzlich manuell im
 Tab "Actions" ueber "Run workflow" ausgeloest werden) und baut:
 
-- eine **Windows-EXE** (`MQTT-Ablaufplaner-vX.Y.Z-windows.exe`)
-- eine **macOS-App fuer Apple Silicon** (`MQTT-Ablaufplaner-vX.Y.Z-macos-arm64.zip`,
-  gebaut nativ auf einem `macos-14`-Runner mit `--target-arch arm64`)
+- eine **Windows-EXE** (`MQTT-Ablaufplaner-vX.Y.Z-windows.exe`) - startet
+  immer mit sichtbarem Konsolenfenster.
+- ein **macOS-Paket fuer Apple Silicon** (`MQTT-Ablaufplaner-vX.Y.Z-macos-arm64.zip`,
+  gebaut nativ auf einem `macos-14`-Runner mit `--target-arch arm64`),
+  bestehend aus der Programmdatei `MQTT-Ablaufplaner` und einem
+  Start-Skript `Start-MQTT-Ablaufplaner.command`.
 
 Beide Dateien findest du danach im jeweiligen Workflow-Lauf unter
 "Artifacts".
+
+### Programm starten/beenden
+
+Das Programm startet bewusst immer mit einem sichtbaren
+Terminal-/Konsolenfenster, in dem der Serverstatus zu sehen ist - so
+laesst es sich jederzeit einfach wieder beenden:
+
+- **Windows:** `MQTT-Ablaufplaner-....exe` doppelklicken - es oeffnet
+  sich ein Konsolenfenster. Zum Beenden das Fenster schliessen oder
+  darin STRG+C druecken.
+- **macOS:** die Datei `Start-MQTT-Ablaufplaner.command` doppelklicken
+  (nicht die Programmdatei `MQTT-Ablaufplaner` selbst) - der Finder
+  oeffnet dafuer automatisch ein Terminal-Fenster. Zum Beenden das
+  Terminal-Fenster schliessen (mit "Beenden" bestaetigen) oder STRG+C
+  druecken. Beide Dateien muessen dabei im selben Ordner liegen.
 
 ### Ein Release mit fertigen Downloads erzeugen
 
@@ -79,14 +97,16 @@ passen (Zeile ganz oben in der Datei) - der Workflow liest die Version
 per Regex direkt aus dieser Konstante fuer die Dateinamen und den
 Release-Titel aus.
 
-### Hinweis zu unsignierten Apps
+### Hinweis zu unsignierten Dateien
 
 Die gebauten Dateien sind nicht signiert/notarisiert:
 - **Windows** zeigt beim ersten Start ggf. eine SmartScreen-Warnung
   ("Weitere Informationen" -> "Trotzdem ausfuehren").
-- **macOS** blockiert die App zunaechst als "nicht verifizierter
-  Entwickler" - im Finder mit Rechtsklick -> "Oeffnen" bestaetigen (nur
-  beim ersten Start noetig).
+- **macOS** kann die Programmdatei beim ersten Start als "nicht
+  verifizierter Entwickler" blockieren. Falls das passiert: im Finder
+  mit Rechtsklick auf `MQTT-Ablaufplaner` -> "Oeffnen" bestaetigen
+  (nur einmalig noetig), oder im Terminal im entpackten Ordner
+  `xattr -cr .` ausfuehren, um das Quarantaene-Flag zu entfernen.
 
 ## Bei jeder Aenderung
 
