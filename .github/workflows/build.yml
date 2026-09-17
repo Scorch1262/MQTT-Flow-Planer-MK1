@@ -1,0 +1,128 @@
+name: Build
+
+# Baut bei jedem Push auf main (und manuell auf Knopfdruck) eine Windows-
+# EXE und eine macOS-App fuer Apple Silicon. Bei einem Push eines Tags
+# im Format "vX.Y.Z" wird zusaetzlich automatisch ein GitHub-Release mit
+# beiden Dateien im Anhang erstellt.
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------------
+  # Version aus app.py auslesen (einzige Quelle der Wahrheit: APP_VERSION)
+  # ------------------------------------------------------------------
+  read-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: get_version
+        shell: bash
+        run: |
+          VERSION=$(grep -oP '(?<=APP_VERSION = ")[^"]+' app.py)
+          echo "Gefundene Version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------
+  # Windows: einzelne .exe per PyInstaller
+  # ------------------------------------------------------------------
+  build-windows:
+    needs: read-version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Abhaengigkeiten installieren
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: EXE bauen
+        run: >
+          pyinstaller --onefile --noconsole
+          --name "MQTT-Ablaufplaner"
+          app.py
+
+      - name: Artefakt umbenennen (mit Versionsnummer)
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "dist/MQTT-Ablaufplaner.exe" "out/MQTT-Ablaufplaner-v${{ needs.read-version.outputs.version }}-windows.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MQTT-Ablaufplaner-windows
+          path: out/*.exe
+
+  # ------------------------------------------------------------------
+  # macOS (Apple Silicon / arm64): .app-Bundle per PyInstaller
+  # Der Runner "macos-14" ist ein nativer Apple-Silicon-Runner, das
+  # Ergebnis ist somit eine native arm64-App (kein Rosetta noetig).
+  # ------------------------------------------------------------------
+  build-macos:
+    needs: read-version
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Abhaengigkeiten installieren
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: App bauen
+        run: >
+          pyinstaller --windowed
+          --name "MQTT-Ablaufplaner"
+          --target-arch arm64
+          app.py
+
+      - name: App als ZIP verpacken (mit Versionsnummer)
+        run: |
+          mkdir -p out
+          cd dist
+          zip -ry "../out/MQTT-Ablaufplaner-v${{ needs.read-version.outputs.version }}-macos-arm64.zip" "MQTT-Ablaufplaner.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MQTT-Ablaufplaner-macos
+          path: out/*.zip
+
+  # ------------------------------------------------------------------
+  # Bei einem Tag-Push (z. B. "v1.0.0") ein GitHub-Release mit beiden
+  # gebauten Dateien im Anhang erstellen.
+  # ------------------------------------------------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [read-version, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Release erstellen
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "MQTT-Ablaufplaner v${{ needs.read-version.outputs.version }}"
+          files: |
+            artifacts/MQTT-Ablaufplaner-windows/*.exe
+            artifacts/MQTT-Ablaufplaner-macos/*.zip

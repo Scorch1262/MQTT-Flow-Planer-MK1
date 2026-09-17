@@ -1,0 +1,21 @@
+# Laufzeit-/Nutzerdaten (enthalten ggf. Broker-Zugangsdaten - nicht versionieren)
+config.json
+config.json.tmp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
