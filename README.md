@@ -1,6 +1,6 @@
 # MQTT-Ablauf- und Verschaltungsplaner
 
-![Bild](Bilder.png)
+![Bild](Bild.png)
 
 Ein lokal laufendes Web-Tool, um MQTT-gestuetzte Automatisierungen als
 Blockschaltbild zu entwerfen - Bloecke werden per Klick auf die
