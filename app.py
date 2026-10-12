@@ -15,8 +15,10 @@ Block-Typen:
     Topic bei einem Broker. "{payload}" im Text wird durch die zuletzt
     empfangene Nachricht des ausloesenden Ereignisses ersetzt.
   - Wartezeit: pausiert den Ablauf fuer eine einstellbare Dauer.
-  - Bedingung: vergleicht die zuletzt empfangene Nachricht mit einem
-    Wert und verzweigt den Ablauf nach "Ja" oder "Nein".
+  - Bedingung: prueft entweder die zuletzt empfangene Nachricht
+    (Payload-Vergleich), die Uhrzeit, den Sonnenstand (aufgegangen/
+    untergegangen), den Wochentag oder das Datum und verzweigt den
+    Ablauf nach "Ja" oder "Nein".
 
 Die komplette Verschaltung (Broker, Bloecke, Verbindungen, Ansicht)
 wird menschenlesbar in "config.json" gespeichert, die im selben
@@ -35,7 +37,7 @@ Erreichbar unter:      http://<IP-DES-PCS>:8020  (im gesamten LAN)
 #   PATCH (x.x.+1) -> Bugfix, keine neuen Funktionen
 #   MINOR (x.+1.0) -> neue Funktion, abwaertskompatibel
 #   MAJOR (+1.0.0) -> Breaking Change (z. B. Config-Format aendert sich)
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 import os
 import sys
@@ -44,8 +46,9 @@ import ssl
 import time
 import copy
 import uuid
+import math
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask, request, jsonify, Response
 
@@ -83,6 +86,7 @@ DEFAULT_CONFIG = {
                   "geschrieben. Manuelle Aenderungen sind moeglich, aber "
                   "bitte gueltiges JSON beibehalten.",
     "server": {"host": "0.0.0.0", "port": 8020},
+    "location": {"lat": 51.1657, "lon": 10.4515},
     "brokers": [],
     "nodes": [],
     "connections": []
@@ -106,6 +110,7 @@ def load_config() -> dict:
     cfg.setdefault("brokers", [])
     cfg.setdefault("nodes", [])
     cfg.setdefault("connections", [])
+    cfg.setdefault("location", copy.deepcopy(DEFAULT_CONFIG["location"]))
 
     for b in cfg["brokers"]:
         b.setdefault("port", 1883)
@@ -125,6 +130,17 @@ def load_config() -> dict:
         n.setdefault("delay_sec", 1.0)
         n.setdefault("operator", "eq")
         n.setdefault("compare_value", "")
+        n.setdefault("cond_type", "payload")
+        n.setdefault("time_mode", "between")
+        n.setdefault("time_from", "08:00")
+        n.setdefault("time_to", "18:00")
+        n.setdefault("sun_state", "up")
+        n.setdefault("sun_offset_min", 0)
+        n.setdefault("weekdays", [0, 1, 2, 3, 4])
+        n.setdefault("date_mode", "equal")
+        n.setdefault("date_from", "")
+        n.setdefault("date_to", "")
+        n.setdefault("date_yearly", False)
 
     return cfg
 
@@ -135,6 +151,149 @@ def save_config(cfg: dict) -> None:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
         os.replace(tmp_path, CONFIG_PATH)
+
+
+# --------------------------------------------------------------------------
+# Zeit-/Sonnen-/Datums-Bedingungen
+# --------------------------------------------------------------------------
+COND_LABELS = {"payload": "Payload", "time": "Uhrzeit", "sun": "Sonnenstand",
+               "weekday": "Wochentag", "date": "Datum"}
+
+
+def _parse_hhmm(text):
+    try:
+        h, m = str(text).strip().split(":")[:2]
+        h, m = int(h), int(m)
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h * 60 + m
+    except Exception:
+        pass
+    return None
+
+
+def _parse_date(text):
+    try:
+        return datetime.strptime(str(text).strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def sun_times(day, lat, lon):
+    """Sonnenauf-/-untergang fuer ein Datum (NOAA-Naeherung, rein lokal
+    berechnet - keine Internetverbindung noetig). Gibt (aufgang, untergang,
+    polar) zurueck; aufgang/untergang sind zeitzonenbewusste datetime-Werte
+    in der lokalen Zeitzone. polar ist None, "day" (Mitternachtssonne) oder
+    "night" (Polarnacht); dann sind aufgang/untergang None."""
+    lat = max(-89.9, min(89.9, float(lat)))
+    n = day.timetuple().tm_yday
+    g = 2 * math.pi / 365.0 * (n - 1)
+    eqtime = 229.18 * (0.000075 + 0.001868 * math.cos(g) - 0.032077 * math.sin(g)
+                       - 0.014615 * math.cos(2 * g) - 0.040849 * math.sin(2 * g))
+    decl = (0.006918 - 0.399912 * math.cos(g) + 0.070257 * math.sin(g)
+            - 0.006758 * math.cos(2 * g) + 0.000907 * math.sin(2 * g)
+            - 0.002697 * math.cos(3 * g) + 0.00148 * math.sin(3 * g))
+    lat_r = math.radians(lat)
+    cos_ha = (math.cos(math.radians(90.833)) / (math.cos(lat_r) * math.cos(decl))
+              - math.tan(lat_r) * math.tan(decl))
+    if cos_ha > 1:
+        return None, None, "night"
+    if cos_ha < -1:
+        return None, None, "day"
+    ha = math.degrees(math.acos(cos_ha))
+    base = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    rise = (base + timedelta(minutes=720 - 4 * (lon + ha) - eqtime)).astimezone()
+    sett = (base + timedelta(minutes=720 - 4 * (lon - ha) - eqtime)).astimezone()
+    return rise, sett, None
+
+
+def is_sun_up(now, lat, lon, offset_min=0):
+    """True, wenn die Sonne zum Zeitpunkt `now` (zeitzonenbewusst) aufgegangen
+    ist. offset_min verschiebt Auf- und Untergang (z. B. +30 = 30 Minuten
+    spaeter, -30 = 30 Minuten frueher)."""
+    off = timedelta(minutes=offset_min)
+    polar = None
+    for delta in (-1, 0, 1):
+        rise, sett, pol = sun_times((now + timedelta(days=delta)).date(), lat, lon)
+        if delta == 0:
+            polar = pol
+        if rise is None:
+            continue
+        if rise + off <= now < sett + off:
+            return True
+    return polar == "day"
+
+
+def evaluate_condition(node, payload_ctx, location, now=None):
+    """Wertet einen Bedingungs-Block aus und gibt True ("Ja") oder False
+    ("Nein") zurueck."""
+    try:
+        now = now or datetime.now().astimezone()
+        ctype = node.get("cond_type", "payload")
+
+        if ctype == "time":
+            cur = now.hour * 60 + now.minute
+            a = _parse_hhmm(node.get("time_from"))
+            b = _parse_hhmm(node.get("time_to"))
+            mode = node.get("time_mode", "between")
+            if a is None:
+                return False
+            if mode == "after":
+                return cur >= a
+            if mode == "before":
+                return cur < a
+            if b is None:
+                return False
+            if a <= b:
+                return a <= cur < b
+            return cur >= a or cur < b  # Zeitfenster ueber Mitternacht
+
+        if ctype == "sun":
+            lat = float((location or {}).get("lat", 51.1657))
+            lon = float((location or {}).get("lon", 10.4515))
+            off = int(float(node.get("sun_offset_min", 0) or 0))
+            up = is_sun_up(now, lat, lon, off)
+            return up if node.get("sun_state", "up") == "up" else not up
+
+        if ctype == "weekday":
+            days = [int(d) for d in (node.get("weekdays") or [])]
+            return now.weekday() in days  # 0 = Montag ... 6 = Sonntag
+
+        if ctype == "date":
+            d1 = _parse_date(node.get("date_from"))
+            d2 = _parse_date(node.get("date_to"))
+            yearly = bool(node.get("date_yearly"))
+            today = now.date()
+            if d1 is None:
+                return False
+            if node.get("date_mode", "equal") == "equal":
+                if yearly:
+                    return (today.month, today.day) == (d1.month, d1.day)
+                return today == d1
+            if d2 is None:
+                return False
+            if yearly:
+                t = (today.month, today.day)
+                a = (d1.month, d1.day)
+                b = (d2.month, d2.day)
+                return a <= t <= b if a <= b else (t >= a or t <= b)
+            return d1 <= today <= d2
+
+        # Standard: Vergleich mit der zuletzt empfangenen Nachricht
+        op = node.get("operator", "eq")
+        cmp_val = node.get("compare_value", "")
+        if op == "eq":
+            return payload_ctx == cmp_val
+        if op == "neq":
+            return payload_ctx != cmp_val
+        if op == "contains":
+            return cmp_val in payload_ctx
+        if op == "gt":
+            return float(payload_ctx) > float(cmp_val)
+        if op == "lt":
+            return float(payload_ctx) < float(cmp_val)
+        return False
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -350,23 +509,10 @@ class FlowEngine:
                 return "out"
 
             if ntype == "condition":
-                op = node.get("operator", "eq")
-                cmp_val = node.get("compare_value", "")
-                ok = False
-                try:
-                    if op == "eq":
-                        ok = payload_ctx == cmp_val
-                    elif op == "neq":
-                        ok = payload_ctx != cmp_val
-                    elif op == "contains":
-                        ok = cmp_val in payload_ctx
-                    elif op == "gt":
-                        ok = float(payload_ctx) > float(cmp_val)
-                    elif op == "lt":
-                        ok = float(payload_ctx) < float(cmp_val)
-                except Exception:
-                    ok = False
-                self.log_event(f"Bedingung '{node.get('label') or node['id']}': {'Ja' if ok else 'Nein'}")
+                ok = evaluate_condition(node, payload_ctx, load_config().get("location") or {})
+                ctype = node.get("cond_type", "payload")
+                self.log_event(f"Bedingung '{node.get('label') or node['id']}' "
+                               f"({COND_LABELS.get(ctype, ctype)}): {'Ja' if ok else 'Nein'}")
                 return "true" if ok else "false"
 
             if ntype == "mqtt_in":
@@ -411,6 +557,7 @@ def api_save_config():
     data.setdefault("brokers", [])
     data.setdefault("nodes", [])
     data.setdefault("connections", [])
+    data.setdefault("location", DEFAULT_CONFIG["location"])
     save_config(data)
     ENGINE.rebuild(data)
     return jsonify({"status": "ok"})
@@ -581,6 +728,10 @@ INDEX_HTML = r"""
   table.broker-table th, table.broker-table td{ text-align:left; padding:6px 4px; border-bottom:1px solid var(--border); }
   table.broker-table th{ color:var(--text-dim); font-weight:500; font-size:11px; }
 
+  .wd-row{ display:flex; gap:8px; flex-wrap:wrap; margin-top:4px; }
+  .wd-row label{ display:flex; align-items:center; gap:4px; margin:0; font-size:12px; color:var(--text); }
+  .wd-row input{ width:auto; }
+  .hint{ font-size:11.5px; color:var(--text-dim); line-height:1.5; margin-top:8px; }
   .toast-container{ position:fixed; top:14px; right:14px; z-index:80; display:flex; flex-direction:column;
                      gap:8px; max-width:320px; }
   .toast{ background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px;
@@ -594,6 +745,7 @@ INDEX_HTML = r"""
   <h1>MQTT-<span>Ablaufplaner</span><span class="ver-badge" id="verBadge"></span></h1>
   <div class="header-actions">
     <button class="btn-ghost" onclick="openBrokerModal()">Broker</button>
+    <button class="btn-ghost" onclick="openLocationModal()">Standort</button>
     <button class="btn" onclick="saveConfig(true)">Speichern</button>
   </div>
 </header>
@@ -662,16 +814,78 @@ INDEX_HTML = r"""
       <input id="delay_sec" type="number" min="0" step="0.5">
     </div>
     <div id="fields_condition">
-      <label>Vergleichsoperator</label>
-      <select id="cond_op">
-        <option value="eq">ist gleich</option>
-        <option value="neq">ist ungleich</option>
-        <option value="contains">enthaelt</option>
-        <option value="gt">ist groesser als (Zahl)</option>
-        <option value="lt">ist kleiner als (Zahl)</option>
+      <label>Bedingung prüfen auf</label>
+      <select id="cond_type" onchange="onCondTypeChange()">
+        <option value="payload">Nachrichteninhalt (Payload)</option>
+        <option value="time">Uhrzeit</option>
+        <option value="sun">Sonne aufgegangen / untergegangen</option>
+        <option value="weekday">Wochentag</option>
+        <option value="date">Datum</option>
       </select>
-      <label>Vergleichswert</label>
-      <input id="cond_value" placeholder="z. B. 25">
+
+      <div id="cond_payload">
+        <label>Vergleichsoperator</label>
+        <select id="cond_op">
+          <option value="eq">ist gleich</option>
+          <option value="neq">ist ungleich</option>
+          <option value="contains">enthaelt</option>
+          <option value="gt">ist groesser als (Zahl)</option>
+          <option value="lt">ist kleiner als (Zahl)</option>
+        </select>
+        <label>Vergleichswert</label>
+        <input id="cond_value" placeholder="z. B. 25">
+      </div>
+
+      <div id="cond_time">
+        <label>Modus</label>
+        <select id="time_mode" onchange="onCondTypeChange()">
+          <option value="between">zwischen (von - bis)</option>
+          <option value="after">ab Uhrzeit</option>
+          <option value="before">vor Uhrzeit</option>
+        </select>
+        <div class="row">
+          <div><label id="time_from_lbl">Von</label><input id="time_from" type="time"></div>
+          <div id="time_to_wrap"><label>Bis</label><input id="time_to" type="time"></div>
+        </div>
+        <div class="hint">Zeitfenster über Mitternacht sind möglich (z. B. 22:00 bis 06:00).</div>
+      </div>
+
+      <div id="cond_sun">
+        <label>Zustand</label>
+        <select id="sun_state">
+          <option value="up">Sonne ist aufgegangen (Tag)</option>
+          <option value="down">Sonne ist untergegangen (Nacht)</option>
+        </select>
+        <label>Zeitversatz in Minuten (+ später, - früher)</label>
+        <input id="sun_offset" type="number" step="1" value="0">
+        <div class="hint">Berechnet lokal anhand des Standorts (Knopf „Standort“ oben rechts) und der Zeitzone des Rechners.</div>
+      </div>
+
+      <div id="cond_weekday">
+        <label>Wochentage, an denen die Bedingung „Ja“ ist</label>
+        <div class="wd-row">
+          <label><input type="checkbox" value="0">Mo</label>
+          <label><input type="checkbox" value="1">Di</label>
+          <label><input type="checkbox" value="2">Mi</label>
+          <label><input type="checkbox" value="3">Do</label>
+          <label><input type="checkbox" value="4">Fr</label>
+          <label><input type="checkbox" value="5">Sa</label>
+          <label><input type="checkbox" value="6">So</label>
+        </div>
+      </div>
+
+      <div id="cond_date">
+        <label>Modus</label>
+        <select id="date_mode" onchange="onCondTypeChange()">
+          <option value="equal">an einem bestimmten Datum</option>
+          <option value="between">in einem Zeitraum (von - bis)</option>
+        </select>
+        <div class="row">
+          <div><label id="date_from_lbl">Datum</label><input id="date_from" type="date"></div>
+          <div id="date_to_wrap"><label>Bis</label><input id="date_to" type="date"></div>
+        </div>
+        <div class="checkbox-line"><input type="checkbox" id="date_yearly"><label style="margin:0;">jährlich wiederkehrend (Jahr ignorieren)</label></div>
+      </div>
     </div>
     <div class="modal-error" id="nodeError"></div>
     <div class="actions">
@@ -706,8 +920,25 @@ INDEX_HTML = r"""
   </div>
 </div>
 
+<!-- Standort-Modal -->
+<div class="modal-backdrop" id="locationModal">
+  <div class="modal">
+    <h2>Standort (für Sonnenauf-/-untergang)</h2>
+    <div class="row">
+      <div><label>Breitengrad</label><input id="loc_lat" type="number" step="0.0001" min="-90" max="90"></div>
+      <div><label>Längengrad</label><input id="loc_lon" type="number" step="0.0001" min="-180" max="180"></div>
+    </div>
+    <div class="hint">Beispiel Berlin: 52.5200 / 13.4050. Die Zeiten werden lokal berechnet (keine Internetverbindung nötig) und nutzen die Zeitzone des Rechners bzw. Routers.</div>
+    <div class="modal-error" id="locError"></div>
+    <div class="actions">
+      <button class="btn-ghost" onclick="closeLocationModal()">Abbrechen</button>
+      <button class="btn" onclick="submitLocation()">Speichern</button>
+    </div>
+  </div>
+</div>
+
 <script>
-let STATE = { brokers: [], nodes: [], connections: [] };
+let STATE = { brokers: [], nodes: [], connections: [], location: { lat: 51.1657, lon: 10.4515 } };
 let selectedNodeId = null, selectedConnId = null, editingNodeId = null;
 let dragNode = null, dragOffset = {x:0,y:0};
 let drawingConn = null; // {fromId, fromPort, x1, y1}
@@ -744,6 +975,7 @@ async function loadConfig(){
   const res = await fetch('/api/config');
   const data = await res.json();
   STATE.brokers = data.brokers; STATE.nodes = data.nodes; STATE.connections = data.connections;
+  if (data.location) STATE.location = data.location;
   renderAll();
   renderLog(data._events || []);
 }
@@ -757,7 +989,8 @@ async function saveConfig(showToast){
   const res = await fetch('/api/config', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ server: {host:'0.0.0.0', port:8020}, brokers: STATE.brokers,
-                           nodes: STATE.nodes, connections: STATE.connections })
+                           nodes: STATE.nodes, connections: STATE.connections,
+                           location: STATE.location })
   });
   if (showToast){
     if (res.ok) toast('Gespeichert.'); else toast('Fehler beim Speichern.', false);
@@ -771,7 +1004,10 @@ function addNode(type){
     id: 'node_' + Math.random().toString(16).slice(2,10),
     type, x: 60 + (count % 6) * 40, y: 60 + Math.floor(count/6) * 120,
     label:'', broker_id:'', topic:'', payload:'', qos:0, retain:false,
-    delay_sec:1.0, operator:'eq', compare_value:''
+    delay_sec:1.0, operator:'eq', compare_value:'',
+    cond_type:'payload', time_mode:'between', time_from:'08:00', time_to:'18:00',
+    sun_state:'up', sun_offset_min:0, weekdays:[0,1,2,3,4],
+    date_mode:'equal', date_from:'', date_to:'', date_yearly:false
   };
   STATE.nodes.push(node);
   renderAll(); scheduleSave();
@@ -789,7 +1025,7 @@ function nodeSummary(n){
   if (n.type === 'mqtt_in') return `Broker: <b>${escapeHtml(b?b.name:'-')}</b><br>Topic: <b>${escapeHtml(n.topic||'-')}</b>`;
   if (n.type === 'mqtt_out') return `Broker: <b>${escapeHtml(b?b.name:'-')}</b><br>Topic: <b>${escapeHtml(n.topic||'-')}</b><br>Payload: <b>${escapeHtml(n.payload||'-')}</b>`;
   if (n.type === 'delay') return `Dauer: <b>${escapeHtml(n.delay_sec)} s</b>`;
-  if (n.type === 'condition') return `Wenn Wert ${escapeHtml(opLabel(n.operator))} <b>${escapeHtml(n.compare_value||'-')}</b>`;
+  if (n.type === 'condition') return condSummary(n);
   return '';
 }
 function opLabel(op){
@@ -890,13 +1126,15 @@ async function pollLog(){
 
 // ---------------- Verschieben ----------------
 function startDrag(e, id){
+  if (e.target.closest('.node-del')) return; // Klick auf das x: kein Drag
   e.preventDefault();
   selectedNodeId = id; selectedConnId = null;
   const n = nodeById(id);
   const wrap = document.getElementById('canvasWrap');
   dragNode = id;
   dragOffset = { x: e.clientX + wrap.scrollLeft - n.x, y: e.clientY + wrap.scrollTop - n.y };
-  renderAll();
+  document.querySelectorAll('.flow-node').forEach(el => el.classList.toggle('selected', el.dataset.id === id));
+  renderConnections();
 }
 document.addEventListener('mousemove', (e) => {
   if (dragNode){
@@ -1022,8 +1260,7 @@ function openNodeModal(id){
   } else if (n.type === 'delay'){
     document.getElementById('delay_sec').value = n.delay_sec ?? 1.0;
   } else if (n.type === 'condition'){
-    document.getElementById('cond_op').value = n.operator || 'eq';
-    document.getElementById('cond_value').value = n.compare_value || '';
+    loadCondFields(n);
   }
   document.getElementById('nodeModal').classList.add('show');
 }
@@ -1050,8 +1287,7 @@ function submitNode(){
   } else if (n.type === 'delay'){
     n.delay_sec = parseFloat(document.getElementById('delay_sec').value)||0;
   } else if (n.type === 'condition'){
-    n.operator = document.getElementById('cond_op').value;
-    n.compare_value = document.getElementById('cond_value').value;
+    if (!readCondFields(n, errEl)) return;
   }
   closeNodeModal();
   renderAll(); scheduleSave();
@@ -1071,6 +1307,121 @@ async function fireTest(){
     })});
   const data = await res.json();
   if (res.ok) toast('Testnachricht gesendet.'); else toast(data.error || 'Fehler beim Senden.', false);
+}
+
+const WD = ['Mo','Di','Mi','Do','Fr','Sa','So'];
+function condSummary(n){
+  const t = n.cond_type || 'payload';
+  if (t === 'time'){
+    if (n.time_mode === 'after') return `Uhrzeit ab <b>${escapeHtml(n.time_from||'-')}</b>`;
+    if (n.time_mode === 'before') return `Uhrzeit vor <b>${escapeHtml(n.time_from||'-')}</b>`;
+    return `Uhrzeit <b>${escapeHtml(n.time_from||'-')} - ${escapeHtml(n.time_to||'-')}</b>`;
+  }
+  if (t === 'sun'){
+    const off = parseInt(n.sun_offset_min) || 0;
+    const offTxt = off ? ` (${off > 0 ? '+' : ''}${off} min)` : '';
+    return `Sonne ist <b>${n.sun_state === 'down' ? 'untergegangen' : 'aufgegangen'}</b>${offTxt}`;
+  }
+  if (t === 'weekday'){
+    const days = (n.weekdays || []).map(Number).sort((a,b) => a-b).map(d => WD[d]).join(', ');
+    return `Wochentag: <b>${escapeHtml(days || '-')}</b>`;
+  }
+  if (t === 'date'){
+    const y = n.date_yearly ? ' (jährlich)' : '';
+    if (n.date_mode === 'between') return `Datum <b>${escapeHtml(n.date_from||'-')} bis ${escapeHtml(n.date_to||'-')}</b>${y}`;
+    return `Datum ist <b>${escapeHtml(n.date_from||'-')}</b>${y}`;
+  }
+  const lbl = {eq:'=', neq:'&ne;', contains:'enthält', gt:'&gt;', lt:'&lt;'}[n.operator] || escapeHtml(n.operator || '');
+  return `Wenn Wert ${lbl} <b>${escapeHtml(n.compare_value||'-')}</b>`;
+}
+
+function onCondTypeChange(){
+  const t = document.getElementById('cond_type').value;
+  ['payload','time','sun','weekday','date'].forEach(k => {
+    document.getElementById('cond_' + k).style.display = (k === t) ? 'block' : 'none';
+  });
+  const tm = document.getElementById('time_mode').value;
+  document.getElementById('time_to_wrap').style.display = (tm === 'between') ? 'block' : 'none';
+  document.getElementById('time_from_lbl').textContent = (tm === 'between') ? 'Von' : 'Uhrzeit';
+  const dm = document.getElementById('date_mode').value;
+  document.getElementById('date_to_wrap').style.display = (dm === 'between') ? 'block' : 'none';
+  document.getElementById('date_from_lbl').textContent = (dm === 'between') ? 'Von' : 'Datum';
+}
+
+function loadCondFields(n){
+  document.getElementById('cond_type').value = n.cond_type || 'payload';
+  document.getElementById('cond_op').value = n.operator || 'eq';
+  document.getElementById('cond_value').value = n.compare_value || '';
+  document.getElementById('time_mode').value = n.time_mode || 'between';
+  document.getElementById('time_from').value = n.time_from || '08:00';
+  document.getElementById('time_to').value = n.time_to || '18:00';
+  document.getElementById('sun_state').value = n.sun_state || 'up';
+  document.getElementById('sun_offset').value = n.sun_offset_min || 0;
+  const days = (n.weekdays || [0,1,2,3,4]).map(Number);
+  document.querySelectorAll('#cond_weekday input[type=checkbox]').forEach(cb => {
+    cb.checked = days.includes(parseInt(cb.value));
+  });
+  document.getElementById('date_mode').value = n.date_mode || 'equal';
+  document.getElementById('date_from').value = n.date_from || '';
+  document.getElementById('date_to').value = n.date_to || '';
+  document.getElementById('date_yearly').checked = !!n.date_yearly;
+  onCondTypeChange();
+}
+
+function readCondFields(n, errEl){
+  const t = document.getElementById('cond_type').value;
+  const fail = (msg) => { errEl.textContent = msg; errEl.style.display = 'block'; return false; };
+  if (t === 'time'){
+    const mode = document.getElementById('time_mode').value;
+    const from = document.getElementById('time_from').value;
+    const to = document.getElementById('time_to').value;
+    if (!from) return fail('Bitte eine Uhrzeit angeben.');
+    if (mode === 'between' && !to) return fail('Bitte Start- und Endzeit angeben.');
+    n.time_mode = mode; n.time_from = from; if (mode === 'between') n.time_to = to;
+  } else if (t === 'sun'){
+    n.sun_state = document.getElementById('sun_state').value;
+    n.sun_offset_min = parseInt(document.getElementById('sun_offset').value) || 0;
+  } else if (t === 'weekday'){
+    const days = [];
+    document.querySelectorAll('#cond_weekday input[type=checkbox]').forEach(cb => {
+      if (cb.checked) days.push(parseInt(cb.value));
+    });
+    if (!days.length) return fail('Bitte mindestens einen Wochentag auswählen.');
+    n.weekdays = days;
+  } else if (t === 'date'){
+    const mode = document.getElementById('date_mode').value;
+    const from = document.getElementById('date_from').value;
+    const to = document.getElementById('date_to').value;
+    if (!from) return fail('Bitte ein Datum angeben.');
+    if (mode === 'between' && !to) return fail('Bitte Start- und Enddatum angeben.');
+    n.date_mode = mode; n.date_from = from; if (mode === 'between') n.date_to = to;
+    n.date_yearly = document.getElementById('date_yearly').checked;
+  } else {
+    n.operator = document.getElementById('cond_op').value;
+    n.compare_value = document.getElementById('cond_value').value;
+  }
+  n.cond_type = t;
+  return true;
+}
+
+// ---------------- Standort-Modal ----------------
+function openLocationModal(){
+  document.getElementById('locError').style.display = 'none';
+  document.getElementById('loc_lat').value = STATE.location.lat;
+  document.getElementById('loc_lon').value = STATE.location.lon;
+  document.getElementById('locationModal').classList.add('show');
+}
+function closeLocationModal(){ document.getElementById('locationModal').classList.remove('show'); }
+function submitLocation(){
+  const errEl = document.getElementById('locError');
+  const lat = parseFloat(document.getElementById('loc_lat').value);
+  const lon = parseFloat(document.getElementById('loc_lon').value);
+  if (isNaN(lat) || isNaN(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180){
+    errEl.textContent = 'Bitte gültige Koordinaten eingeben (Breite -90..90, Länge -180..180).';
+    errEl.style.display = 'block'; return;
+  }
+  STATE.location = { lat, lon };
+  closeLocationModal(); scheduleSave(); toast('Standort gespeichert.');
 }
 
 // ---------------- Broker-Modal ----------------

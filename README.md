@@ -7,7 +7,7 @@ Blockschaltbild zu entwerfen - Bloecke werden per Klick auf die
 Zeichenflaeche gelegt, per Drag & Drop positioniert und durch Linien zu
 einem Ablauf verschaltet (aehnlich Node-RED).
 
-**Aktuelle Version: v1.1.0**
+**Aktuelle Version: v1.2.0**
 
 ## Bloecke
 
@@ -16,7 +16,7 @@ einem Ablauf verschaltet (aehnlich Node-RED).
 | **MQTT Empfangen** | Ereignis/Trigger: abonniert ein Topic bei einem Broker, startet den Ablauf bei ankommender Nachricht (optional nur bei exakt passender Payload). |
 | **MQTT Senden**     | Aktion: veroeffentlicht eine Nachricht auf einem Topic. `{payload}` im Text wird durch die zuletzt empfangene Nachricht des ausloesenden Ereignisses ersetzt. |
 | **Wartezeit**       | Pausiert den Ablauf fuer eine einstellbare Dauer (Sekunden). |
-| **Bedingung**       | Vergleicht die zuletzt empfangene Nachricht mit einem Wert (`=`, `≠`, "enthaelt", `>`, `<`) und verzweigt nach "Ja"/"Nein". |
+| **Bedingung**       | Verzweigt nach "Ja"/"Nein". Pruefbar sind: **Nachrichteninhalt** (`=`, `≠`, "enthaelt", `>`, `<`), **Uhrzeit** (zwischen/ab/vor, auch ueber Mitternacht), **Sonne aufgegangen/untergegangen** (optional mit Minuten-Versatz), **Wochentag** (Mehrfachauswahl) und **Datum** (einzeln oder Zeitraum, optional jaehrlich wiederkehrend). |
 
 Bedienung:
 - **Block platzieren:** links in der Palette anklicken.
@@ -29,6 +29,8 @@ Bedienung:
   ein Ereignis simuliert, ohne auf eine echte Nachricht zu warten; ein
   "MQTT Senden"-Block hat im Bearbeiten-Dialog einen "Jetzt senden
   (Test)"-Knopf.
+
+Fuer die Sonnen-Bedingung den **Standort** (Knopf oben rechts) einstellen - Auf-/Untergang werden lokal berechnet (keine Internetverbindung noetig). Uhrzeit, Wochentag, Datum und Sonne verwenden die **Zeitzone des Rechners/Routers**.
 
 Alle Broker, Bloecke und Verbindungen werden lesbar in `config.json`
 gespeichert (liegt neben dem Skript bzw. der exe/App) und koennen bei
@@ -43,6 +45,13 @@ python app.py
 
 Danach im Browser: `http://127.0.0.1:8020` (im lokalen Netz erreichbar
 ueber die IP des Rechners).
+
+## Installation auf einem GL.iNet-Router (z. B. Brume 2)
+
+Der Brume 2 und aehnliche GL.iNet-Geraete laufen auf OpenWrt
+(ARM64/musl-libc) - die fertigen Windows-/macOS-Dateien passen dort
+nicht, das Programm laesst sich dort aber direkt als Python-Skript
+betreiben. Schritt-fuer-Schritt-Anleitung: [ANLEITUNG-GLiNet-Brume2.md](ANLEITUNG-GLiNet-Brume2.md).
 
 ## Als GitHub-Repo einrichten
 
