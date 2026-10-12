@@ -20,6 +20,12 @@ Block-Typen:
     untergegangen), den Wochentag oder das Datum und verzweigt den
     Ablauf nach "Ja" oder "Nein".
 
+  - Merker: speichert einen Wert (Text oder Zahl, wie ein Merker in einer
+    SPS). Laeuft ein Ablauf in den Block, wird seine Aktion ausgefuehrt
+    (setzen, umschalten, hoch-/herunterzaehlen, zuruecksetzen). Bedingungen
+    koennen den Wert auswerten, Wartezeiten ihn als Dauer verwenden. Auf
+    Wunsch bleibt der Wert nach einem Neustart erhalten (markers.json).
+
 Die komplette Verschaltung (Broker, Bloecke, Verbindungen, Ansicht)
 wird menschenlesbar in "config.json" gespeichert, die im selben
 Verzeichnis wie das Skript / die exe liegt - Handbearbeitung bleibt
@@ -37,7 +43,7 @@ Erreichbar unter:      http://<IP-DES-PCS>:8020  (im gesamten LAN)
 #   PATCH (x.x.+1) -> Bugfix, keine neuen Funktionen
 #   MINOR (x.+1.0) -> neue Funktion, abwaertskompatibel
 #   MAJOR (+1.0.0) -> Breaking Change (z. B. Config-Format aendert sich)
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 import os
 import sys
@@ -74,6 +80,7 @@ def base_dir() -> str:
 
 
 CONFIG_PATH = os.path.join(base_dir(), "config.json")
+MARKERS_PATH = os.path.join(base_dir(), "markers.json")  # remanente Merker-Werte
 LOCK = threading.RLock()
 
 
@@ -141,6 +148,16 @@ def load_config() -> dict:
         n.setdefault("date_from", "")
         n.setdefault("date_to", "")
         n.setdefault("date_yearly", False)
+        n.setdefault("marker_initial", "0")
+        n.setdefault("marker_action", "set")
+        n.setdefault("marker_value", "1")
+        n.setdefault("marker_retain", False)
+        n.setdefault("marker_id", "")
+        n.setdefault("marker_op", "eq")
+        n.setdefault("marker_cmp", "")
+        n.setdefault("delay_source", "fixed")
+        n.setdefault("delay_marker_id", "")
+        n.setdefault("delay_marker_unit", "s")
 
     return cfg
 
@@ -157,7 +174,7 @@ def save_config(cfg: dict) -> None:
 # Zeit-/Sonnen-/Datums-Bedingungen
 # --------------------------------------------------------------------------
 COND_LABELS = {"payload": "Payload", "time": "Uhrzeit", "sun": "Sonnenstand",
-               "weekday": "Wochentag", "date": "Datum"}
+               "weekday": "Wochentag", "date": "Datum", "marker": "Merker"}
 
 
 def _parse_hhmm(text):
@@ -223,7 +240,48 @@ def is_sun_up(now, lat, lon, offset_min=0):
     return polar == "day"
 
 
-def evaluate_condition(node, payload_ctx, location, now=None):
+TRUE_WORDS = ("1", "true", "on", "an", "ein", "ja", "yes", "wahr")
+
+
+def is_truthy(value):
+    """Merker-Wert als Wahrheitswert (1 / true / on / an / ein / ja / yes / wahr)."""
+    return str(value).strip().lower() in TRUE_WORDS
+
+
+def _to_float(value):
+    """Zahl aus Text (Komma oder Punkt als Dezimaltrenner) oder None."""
+    try:
+        number = float(str(value).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _fmt_num(number):
+    if number == int(number):
+        return str(int(number))
+    return ("%f" % number).rstrip("0").rstrip(".")
+
+
+def _compare(op, left, right):
+    """Vergleicht zwei Werte als Text bzw. (bei Zahlen) numerisch."""
+    left, right = str(left), str(right)
+    a, b = _to_float(left), _to_float(right)
+    both = a is not None and b is not None
+    if op == "eq":
+        return left == right or (both and a == b)
+    if op == "neq":
+        return not (left == right or (both and a == b))
+    if op == "contains":
+        return right in left
+    if op in ("gt", "gte", "lt", "lte"):
+        if not both:
+            return False
+        return {"gt": a > b, "gte": a >= b, "lt": a < b, "lte": a <= b}[op]
+    return False
+
+
+def evaluate_condition(node, payload_ctx, location, now=None, markers=None):
     """Wertet einen Bedingungs-Block aus und gibt True ("Ja") oder False
     ("Nein") zurueck."""
     try:
@@ -278,20 +336,21 @@ def evaluate_condition(node, payload_ctx, location, now=None):
                 return a <= t <= b if a <= b else (t >= a or t <= b)
             return d1 <= today <= d2
 
+        if ctype == "marker":
+            values = markers or {}
+            mid = node.get("marker_id")
+            if mid not in values:
+                return False
+            current = values[mid]
+            op = node.get("marker_op", "eq")
+            if op == "true":
+                return is_truthy(current)
+            if op == "false":
+                return not is_truthy(current)
+            return _compare(op, current, node.get("marker_cmp", ""))
+
         # Standard: Vergleich mit der zuletzt empfangenen Nachricht
-        op = node.get("operator", "eq")
-        cmp_val = node.get("compare_value", "")
-        if op == "eq":
-            return payload_ctx == cmp_val
-        if op == "neq":
-            return payload_ctx != cmp_val
-        if op == "contains":
-            return cmp_val in payload_ctx
-        if op == "gt":
-            return float(payload_ctx) > float(cmp_val)
-        if op == "lt":
-            return float(payload_ctx) < float(cmp_val)
-        return False
+        return _compare(node.get("operator", "eq"), payload_ctx, node.get("compare_value", ""))
     except Exception:
         return False
 
@@ -372,6 +431,10 @@ class FlowEngine:
         self._lock = threading.RLock()
         self.last_events = []  # kleine Historie fuer die Oberflaeche
         self._events_lock = threading.RLock()
+        self.markers = {}          # Merker-ID -> aktueller Wert (Text)
+        self._marker_init = {}     # zuletzt gesehener Startwert je Merker
+        self._mlock = threading.RLock()
+        self._persisted = self._load_persisted_markers()
 
     def log_event(self, text: str) -> None:
         with self._events_lock:
@@ -386,6 +449,10 @@ class FlowEngine:
             return list(self.last_events)
 
     def rebuild(self, cfg: dict) -> None:
+        try:
+            self.sync_markers(cfg)
+        except Exception as exc:  # noqa: BLE001
+            self.log_event(f"Merker konnten nicht abgeglichen werden: {exc}")
         with self._lock:
             in_nodes = [n for n in cfg["nodes"] if n["type"] == "mqtt_in" and n.get("broker_id") and n.get("topic")]
             needed_broker_ids = {n["broker_id"] for n in in_nodes}
@@ -471,6 +538,107 @@ class FlowEngine:
             except Exception:
                 pass
 
+    # ---- Merker --------------------------------------------------------
+    def _load_persisted_markers(self):
+        try:
+            with open(MARKERS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_persisted_markers(self):
+        try:
+            tmp = MARKERS_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._persisted, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, MARKERS_PATH)
+        except Exception as exc:  # noqa: BLE001
+            self.log_event(f"Merker konnten nicht gespeichert werden: {exc}")
+
+    def sync_markers(self, cfg: dict) -> None:
+        """Gleicht die Laufzeit-Werte mit der Konfiguration ab: neue Merker
+        bekommen ihren Startwert (bzw. den gespeicherten Wert, wenn remanent),
+        gelöschte Merker verschwinden, und eine geaenderte Startwert-Angabe
+        wird sofort uebernommen."""
+        with self._mlock:
+            nodes = {n["id"]: n for n in cfg["nodes"] if n["type"] == "marker"}
+            for mid in list(self.markers):
+                if mid not in nodes:
+                    del self.markers[mid]
+                    self._marker_init.pop(mid, None)
+            changed = False
+            for mid, n in nodes.items():
+                init = str(n.get("marker_initial", ""))
+                retain = bool(n.get("marker_retain"))
+                if mid not in self.markers:
+                    self.markers[mid] = self._persisted[mid] if (retain and mid in self._persisted) else init
+                elif self._marker_init.get(mid) != init:
+                    self.markers[mid] = init
+                self._marker_init[mid] = init
+                if retain:
+                    if self._persisted.get(mid) != self.markers[mid]:
+                        self._persisted[mid] = self.markers[mid]
+                        changed = True
+                elif mid in self._persisted:
+                    del self._persisted[mid]
+                    changed = True
+            for mid in list(self._persisted):
+                if mid not in nodes:
+                    del self._persisted[mid]
+                    changed = True
+            if changed:
+                self._save_persisted_markers()
+
+    def get_markers(self) -> dict:
+        with self._mlock:
+            return dict(self.markers)
+
+    def set_marker(self, node: dict, value) -> str:
+        value = str(value)
+        with self._mlock:
+            self.markers[node["id"]] = value
+            if node.get("marker_retain"):
+                self._persisted[node["id"]] = value
+                self._save_persisted_markers()
+        return value
+
+    def apply_marker_action(self, node: dict, payload_ctx: str) -> str:
+        action = node.get("marker_action", "set")
+        with self._mlock:
+            current = self.markers.get(node["id"], str(node.get("marker_initial", "")))
+            if action == "set":
+                new = str(node.get("marker_value", "")).replace("{payload}", payload_ctx)
+            elif action == "toggle":
+                new = "0" if is_truthy(current) else "1"
+            elif action in ("inc", "dec"):
+                step = _to_float(node.get("marker_value", "1"))
+                base = _to_float(current)
+                step = 1.0 if step is None else step
+                base = 0.0 if base is None else base
+                new = _fmt_num(base + step if action == "inc" else base - step)
+            elif action == "reset":
+                new = str(node.get("marker_initial", ""))
+            else:
+                new = current
+            return self.set_marker(node, new)
+
+    def _delay_seconds(self, node: dict) -> float:
+        """Wartezeit in Sekunden - als Festwert oder aus einem Merker-Wert."""
+        fixed = max(0.0, float(node.get("delay_sec", 1.0) or 0))
+        if node.get("delay_source", "fixed") != "marker":
+            return fixed
+        with self._mlock:
+            raw = self.markers.get(node.get("delay_marker_id"))
+        factor = {"ms": 0.001, "s": 1.0, "min": 60.0, "h": 3600.0}.get(
+            node.get("delay_marker_unit", "s"), 1.0)
+        number = _to_float(raw)
+        if number is None or number < 0:
+            self.log_event(f"Wartezeit '{node.get('label') or node['id']}': Merker-Wert {raw!r} "
+                           f"ist keine gueltige Dauer - verwende Festwert {fixed:g} s")
+            return fixed
+        return min(number * factor, 7 * 86400.0)  # hoechstens 7 Tage
+
     # ---- Ablauf-Ausfuehrung -------------------------------------------
     def run_flow_from(self, start_node_id: str, payload_ctx: str, start_port: str) -> None:
         cfg = load_config()
@@ -513,15 +681,21 @@ class FlowEngine:
                 return "out"
 
             if ntype == "delay":
-                time.sleep(max(0.0, float(node.get("delay_sec", 1.0) or 0)))
+                time.sleep(self._delay_seconds(node))
                 return "out"
 
             if ntype == "condition":
-                ok = evaluate_condition(node, payload_ctx, load_config().get("location") or {})
+                ok = evaluate_condition(node, payload_ctx, load_config().get("location") or {},
+                                        markers=self.get_markers())
                 ctype = node.get("cond_type", "payload")
                 self.log_event(f"Bedingung '{node.get('label') or node['id']}' "
                                f"({COND_LABELS.get(ctype, ctype)}): {'Ja' if ok else 'Nein'}")
                 return "true" if ok else "false"
+
+            if ntype == "marker":
+                new = self.apply_marker_action(node, payload_ctx)
+                self.log_event(f"Merker '{node.get('label') or node['id']}' = {new!r}")
+                return "out"
 
             if ntype == "mqtt_in":
                 # Ein Ereignis-Block als Zwischenstation macht inhaltlich
@@ -553,6 +727,7 @@ def api_version():
 def api_get_config():
     cfg = load_config()
     cfg["_events"] = ENGINE.get_events()
+    cfg["_markers"] = ENGINE.get_markers()
     return jsonify(cfg)
 
 
@@ -604,9 +779,27 @@ def api_simulate(node_id):
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/markers", methods=["GET"])
+def api_get_markers():
+    return jsonify({"markers": ENGINE.get_markers()})
+
+
+@app.route("/api/markers/<marker_id>", methods=["POST"])
+def api_set_marker(marker_id):
+    """Setzt den Wert eines Merkers von Hand (z. B. zum Testen)."""
+    data = request.get_json(force=True, silent=True) or {}
+    cfg = load_config()
+    node = next((n for n in cfg["nodes"] if n["id"] == marker_id and n["type"] == "marker"), None)
+    if not node:
+        return jsonify({"error": "Merker nicht gefunden (noch nicht gespeichert?)."}), 404
+    ENGINE.set_marker(node, data.get("value", ""))
+    ENGINE.log_event(f"Merker '{node.get('label') or marker_id}' von Hand auf {str(data.get('value', ''))!r} gesetzt")
+    return jsonify({"status": "ok"})
+
+
 @app.route("/api/events")
 def api_events():
-    return jsonify({"events": ENGINE.get_events()})
+    return jsonify({"events": ENGINE.get_events(), "markers": ENGINE.get_markers()})
 
 
 @app.route("/")
@@ -667,6 +860,7 @@ INDEX_HTML = r"""
   .pal-dot{ width:9px; height:9px; border-radius:50%; flex-shrink:0; }
   .dot-in{ background:var(--accent-2); } .dot-out{ background:var(--accent); }
   .dot-delay{ background:var(--text-dim); } .dot-cond{ background:var(--accent-3); }
+  .dot-marker{ background:#4cc9f0; }
 
   .canvas-wrap{ flex:1; position:relative; overflow:auto; background:
     radial-gradient(circle, #1c212a 1px, transparent 1px) 0 0/22px 22px, var(--bg); }
@@ -681,6 +875,7 @@ INDEX_HTML = r"""
   .flow-node.type-mqtt_out{ border-left:4px solid var(--accent); }
   .flow-node.type-delay{ border-left:4px solid var(--text-dim); }
   .flow-node.type-condition{ border-left:4px solid var(--accent-3); }
+  .flow-node.type-marker{ border-left:4px solid #4cc9f0; }
   .node-head{ display:flex; align-items:center; justify-content:space-between; padding:8px 10px;
               background:var(--panel-2); border-bottom:1px solid var(--border); border-radius:8px 8px 0 0;
               cursor:grab; font-size:12px; font-weight:600; }
@@ -768,12 +963,14 @@ INDEX_HTML = r"""
     <div class="pal-item" onclick="addNode('mqtt_out')"><span class="pal-dot dot-out"></span>MQTT Senden</div>
     <div class="pal-item" onclick="addNode('delay')"><span class="pal-dot dot-delay"></span>Wartezeit</div>
     <div class="pal-item" onclick="addNode('condition')"><span class="pal-dot dot-cond"></span>Bedingung</div>
+    <div class="pal-item" onclick="addNode('marker')"><span class="pal-dot dot-marker"></span>Merker</div>
     <h3>Hinweise</h3>
     <div style="font-size:11.5px; color:var(--text-dim); line-height:1.6;">
       Block ziehen: am Kopf anfassen.<br>
       Mehrere Bloecke: auf leerer Flaeche einen Rahmen aufziehen und die markierten Bloecke gemeinsam am Kopf ziehen. Umschalt/Strg + Klick auf den Kopf fuegt hinzu bzw. entfernt, Strg+A waehlt alle, Esc hebt die Auswahl auf.<br>
       Verbinden: am rechten Punkt ziehen, auf linken Punkt eines anderen Blocks loslassen.<br>
       Bearbeiten: auf den Blockinhalt klicken.<br>
+      Merker: speichert einen Wert; Bedingungen und Wartezeiten koennen ihn verwenden.<br>
       Loeschen: Block/Linie anklicken, dann &times; bzw. Entf.
     </div>
   </div>
@@ -822,8 +1019,27 @@ INDEX_HTML = r"""
       </div>
     </div>
     <div id="fields_delay">
-      <label>Wartezeit (Sekunden)</label>
-      <input id="delay_sec" type="number" min="0" step="0.5">
+      <label>Dauer aus</label>
+      <select id="delay_source" onchange="onDelaySourceChange()">
+        <option value="fixed">Festwert</option>
+        <option value="marker">Merker</option>
+      </select>
+      <div id="delay_fixed_wrap">
+        <label id="delay_sec_lbl">Wartezeit (Sekunden)</label>
+        <input id="delay_sec" type="number" min="0" step="0.5">
+      </div>
+      <div id="delay_marker_wrap">
+        <label>Merker (sein Wert ist die Dauer)</label>
+        <select id="delay_marker"></select>
+        <label>Einheit des Merker-Werts</label>
+        <select id="delay_unit">
+          <option value="ms">Millisekunden</option>
+          <option value="s">Sekunden</option>
+          <option value="min">Minuten</option>
+          <option value="h">Stunden</option>
+        </select>
+        <div class="hint">Ist der Merker-Wert keine gültige Zahl, wird stattdessen der Ersatzwert verwendet.</div>
+      </div>
     </div>
     <div id="fields_condition">
       <label>Bedingung prüfen auf</label>
@@ -833,6 +1049,7 @@ INDEX_HTML = r"""
         <option value="sun">Sonne aufgegangen / untergegangen</option>
         <option value="weekday">Wochentag</option>
         <option value="date">Datum</option>
+        <option value="marker">Merker</option>
       </select>
 
       <div id="cond_payload">
@@ -842,7 +1059,9 @@ INDEX_HTML = r"""
           <option value="neq">ist ungleich</option>
           <option value="contains">enthaelt</option>
           <option value="gt">ist groesser als (Zahl)</option>
+          <option value="gte">ist groesser oder gleich (Zahl)</option>
           <option value="lt">ist kleiner als (Zahl)</option>
+          <option value="lte">ist kleiner oder gleich (Zahl)</option>
         </select>
         <label>Vergleichswert</label>
         <input id="cond_value" placeholder="z. B. 25">
@@ -886,6 +1105,27 @@ INDEX_HTML = r"""
         </div>
       </div>
 
+      <div id="cond_marker">
+        <label>Merker</label>
+        <select id="cond_marker_sel"></select>
+        <label>Bedingung</label>
+        <select id="cond_m_op" onchange="onCondTypeChange()">
+          <option value="eq">ist gleich</option>
+          <option value="neq">ist ungleich</option>
+          <option value="gt">ist groesser als (Zahl)</option>
+          <option value="gte">ist groesser oder gleich (Zahl)</option>
+          <option value="lt">ist kleiner als (Zahl)</option>
+          <option value="lte">ist kleiner oder gleich (Zahl)</option>
+          <option value="contains">enthaelt</option>
+          <option value="true">ist wahr (1 / true / an / ja)</option>
+          <option value="false">ist falsch</option>
+        </select>
+        <div id="cond_m_value_wrap">
+          <label>Vergleichswert</label>
+          <input id="cond_m_value" placeholder="z. B. 3">
+        </div>
+      </div>
+
       <div id="cond_date">
         <label>Modus</label>
         <select id="date_mode" onchange="onCondTypeChange()">
@@ -898,6 +1138,24 @@ INDEX_HTML = r"""
         </div>
         <div class="checkbox-line"><input type="checkbox" id="date_yearly"><label style="margin:0;">jährlich wiederkehrend (Jahr ignorieren)</label></div>
       </div>
+    </div>
+    <div id="fields_marker">
+      <div class="hint" style="margin-top:0;">Ein Merker speichert einen Wert. Läuft ein Ablauf in diesen Block, wird die Aktion ausgeführt. Bedingungen und Wartezeiten können den Wert verwenden. Die Bezeichnung oben ist der Name des Merkers.</div>
+      <label>Startwert</label>
+      <input id="m_initial" placeholder="z. B. 0">
+      <label>Aktion, wenn der Ablauf den Block erreicht</label>
+      <select id="m_action" onchange="onMarkerActionChange()">
+        <option value="set">Wert setzen</option>
+        <option value="toggle">Umschalten (0 / 1)</option>
+        <option value="inc">Erhöhen (zählen)</option>
+        <option value="dec">Verringern</option>
+        <option value="reset">Auf Startwert zurücksetzen</option>
+      </select>
+      <div id="m_value_wrap">
+        <label id="m_value_lbl">Wert</label>
+        <input id="m_value" placeholder="z. B. 1">
+      </div>
+      <div class="checkbox-line"><input type="checkbox" id="m_retain"><label style="margin:0;">Wert nach einem Neustart behalten</label></div>
     </div>
     <div class="modal-error" id="nodeError"></div>
     <div class="actions">
@@ -953,6 +1211,7 @@ INDEX_HTML = r"""
 let STATE = { brokers: [], nodes: [], connections: [], location: { lat: 51.1657, lon: 10.4515 } };
 let selectedIds = new Set(), selectedConnId = null, editingNodeId = null;
 let dragGroup = null, marquee = null;
+let MARKER_VALUES = {};
 let dragNode = null, dragOffset = {x:0,y:0};
 let drawingConn = null; // {fromId, fromPort, x1, y1}
 let saveTimer = null;
@@ -974,6 +1233,7 @@ const NODE_META = {
   mqtt_out:   { title: 'MQTT Senden',    hasIn:true,  outs:['out'] },
   delay:      { title: 'Wartezeit',      hasIn:true,  outs:['out'] },
   condition:  { title: 'Bedingung',      hasIn:true,  outs:['true','false'] },
+  marker:     { title: 'Merker',         hasIn:true,  outs:['out'] },
 };
 
 async function loadVersion(){
@@ -989,6 +1249,7 @@ async function loadConfig(){
   const data = await res.json();
   STATE.brokers = data.brokers; STATE.nodes = data.nodes; STATE.connections = data.connections;
   if (data.location) STATE.location = data.location;
+  MARKER_VALUES = data._markers || {};
   renderAll();
   renderLog(data._events || []);
 }
@@ -1020,8 +1281,12 @@ function addNode(type){
     delay_sec:1.0, operator:'eq', compare_value:'',
     cond_type:'payload', time_mode:'between', time_from:'08:00', time_to:'18:00',
     sun_state:'up', sun_offset_min:0, weekdays:[0,1,2,3,4],
-    date_mode:'equal', date_from:'', date_to:'', date_yearly:false
+    date_mode:'equal', date_from:'', date_to:'', date_yearly:false,
+    marker_initial:'0', marker_action:'set', marker_value:'1', marker_retain:false,
+    marker_id:'', marker_op:'eq', marker_cmp:'',
+    delay_source:'fixed', delay_marker_id:'', delay_marker_unit:'s'
   };
+  if (type === 'marker') node.label = nextMarkerName();
   STATE.nodes.push(node);
   renderAll(); scheduleSave();
 }
@@ -1037,8 +1302,9 @@ function nodeSummary(n){
   const b = STATE.brokers.find(x => x.id === n.broker_id);
   if (n.type === 'mqtt_in') return `Broker: <b>${escapeHtml(b?b.name:'-')}</b><br>Topic: <b>${escapeHtml(n.topic||'-')}</b>`;
   if (n.type === 'mqtt_out') return `Broker: <b>${escapeHtml(b?b.name:'-')}</b><br>Topic: <b>${escapeHtml(n.topic||'-')}</b><br>Payload: <b>${escapeHtml(n.payload||'-')}</b>`;
-  if (n.type === 'delay') return `Dauer: <b>${escapeHtml(n.delay_sec)} s</b>`;
+  if (n.type === 'delay') return delaySummary(n);
   if (n.type === 'condition') return condSummary(n);
+  if (n.type === 'marker') return markerSummary(n);
   return '';
 }
 function opLabel(op){
@@ -1055,7 +1321,8 @@ function renderNodes(){
     div.style.left = n.x + 'px'; div.style.top = n.y + 'px';
     div.dataset.id = n.id;
 
-    const playBtn = n.type === 'mqtt_in' ? `<span class="node-play" onclick="simulateNode('${n.id}', event)">&#9654;</span>` : '';
+    const playBtn = n.type === 'mqtt_in' ? `<span class="node-play" onclick="simulateNode('${n.id}', event)">&#9654;</span>`
+                  : n.type === 'marker' ? `<span class="node-play" title="Wert von Hand setzen" onclick="editMarkerValue('${n.id}', event)">&#9998;</span>` : '';
     div.innerHTML = `
       <div class="node-head" onmousedown="startDrag(event,'${n.id}')">
         <span>${escapeHtml(n.label || meta.title)}</span>
@@ -1134,6 +1401,7 @@ async function pollLog(){
     const res = await fetch('/api/events');
     const data = await res.json();
     renderLog(data.events || []);
+    if (data.markers){ MARKER_VALUES = data.markers; updateMarkerValues(); }
   } catch(e){}
 }
 
@@ -1235,6 +1503,7 @@ document.addEventListener('keydown', (e) => {
 function deleteSelected(){
   const ids = new Set(selectedIds);
   if (!ids.size) return;
+  warnMarkerUsed([...ids]);
   STATE.nodes = STATE.nodes.filter(n => !ids.has(n.id));
   STATE.connections = STATE.connections.filter(c => !ids.has(c.from) && !ids.has(c.to));
   selectedIds.clear();
@@ -1299,6 +1568,7 @@ document.addEventListener('keydown', (e) => {
 
 function deleteNode(id, e){
   if (e) e.stopPropagation();
+  warnMarkerUsed([id]);
   STATE.nodes = STATE.nodes.filter(n => n.id !== id);
   STATE.connections = STATE.connections.filter(c => c.from !== id && c.to !== id);
   selectedIds.delete(id);
@@ -1333,7 +1603,7 @@ function openNodeModal(id){
   document.getElementById('nodeError').style.display = 'none';
   document.getElementById('nodeModalTitle').textContent = NODE_META[n.type].title + ' bearbeiten';
   document.getElementById('n_label').value = n.label || '';
-  ['fields_mqtt_in','fields_mqtt_out','fields_delay','fields_condition'].forEach(id2 => {
+  ['fields_mqtt_in','fields_mqtt_out','fields_delay','fields_condition','fields_marker'].forEach(id2 => {
     document.getElementById(id2).style.display = (id2 === 'fields_' + n.type) ? 'block' : 'none';
   });
   if (n.type === 'mqtt_in'){
@@ -1347,9 +1617,11 @@ function openNodeModal(id){
     document.getElementById('out_qos').value = n.qos || 0;
     document.getElementById('out_retain').checked = !!n.retain;
   } else if (n.type === 'delay'){
-    document.getElementById('delay_sec').value = n.delay_sec ?? 1.0;
+    loadDelayFields(n);
   } else if (n.type === 'condition'){
     loadCondFields(n);
+  } else if (n.type === 'marker'){
+    loadMarkerFields(n);
   }
   document.getElementById('nodeModal').classList.add('show');
 }
@@ -1360,6 +1632,7 @@ function closeNodeModal(){
 function submitNode(){
   const n = nodeById(editingNodeId);
   const errEl = document.getElementById('nodeError');
+  const prevLabel = n.label;
   n.label = document.getElementById('n_label').value.trim();
   if (n.type === 'mqtt_in'){
     const bid = document.getElementById('in_broker').value;
@@ -1374,9 +1647,11 @@ function submitNode(){
     n.qos = parseInt(document.getElementById('out_qos').value)||0;
     n.retain = document.getElementById('out_retain').checked;
   } else if (n.type === 'delay'){
-    n.delay_sec = parseFloat(document.getElementById('delay_sec').value)||0;
+    if (!readDelayFields(n, errEl)) return;
   } else if (n.type === 'condition'){
     if (!readCondFields(n, errEl)) return;
+  } else if (n.type === 'marker'){
+    if (!readMarkerFields(n, errEl, prevLabel)) return;
   }
   closeNodeModal();
   renderAll(); scheduleSave();
@@ -1420,13 +1695,21 @@ function condSummary(n){
     if (n.date_mode === 'between') return `Datum <b>${escapeHtml(n.date_from||'-')} bis ${escapeHtml(n.date_to||'-')}</b>${y}`;
     return `Datum ist <b>${escapeHtml(n.date_from||'-')}</b>${y}`;
   }
-  const lbl = {eq:'=', neq:'&ne;', contains:'enthält', gt:'&gt;', lt:'&lt;'}[n.operator] || escapeHtml(n.operator || '');
+  const OPS = {eq:'=', neq:'&ne;', contains:'enthält', gt:'&gt;', gte:'&ge;', lt:'&lt;', lte:'&le;'};
+  if (t === 'marker'){
+    const m = nodeById(n.marker_id);
+    const nm = escapeHtml(m ? (m.label || 'Merker') : '(gelöscht)');
+    if (n.marker_op === 'true') return `Merker <b>${nm}</b> ist wahr`;
+    if (n.marker_op === 'false') return `Merker <b>${nm}</b> ist falsch`;
+    return `Merker <b>${nm}</b> ${OPS[n.marker_op] || '='} <b>${escapeHtml(n.marker_cmp || '-')}</b>`;
+  }
+  const lbl = OPS[n.operator] || escapeHtml(n.operator || '');
   return `Wenn Wert ${lbl} <b>${escapeHtml(n.compare_value||'-')}</b>`;
 }
 
 function onCondTypeChange(){
   const t = document.getElementById('cond_type').value;
-  ['payload','time','sun','weekday','date'].forEach(k => {
+  ['payload','time','sun','weekday','date','marker'].forEach(k => {
     document.getElementById('cond_' + k).style.display = (k === t) ? 'block' : 'none';
   });
   const tm = document.getElementById('time_mode').value;
@@ -1435,6 +1718,8 @@ function onCondTypeChange(){
   const dm = document.getElementById('date_mode').value;
   document.getElementById('date_to_wrap').style.display = (dm === 'between') ? 'block' : 'none';
   document.getElementById('date_from_lbl').textContent = (dm === 'between') ? 'Von' : 'Datum';
+  const mop = document.getElementById('cond_m_op').value;
+  document.getElementById('cond_m_value_wrap').style.display = (mop === 'true' || mop === 'false') ? 'none' : 'block';
 }
 
 function loadCondFields(n){
@@ -1454,6 +1739,9 @@ function loadCondFields(n){
   document.getElementById('date_from').value = n.date_from || '';
   document.getElementById('date_to').value = n.date_to || '';
   document.getElementById('date_yearly').checked = !!n.date_yearly;
+  fillMarkerSelect(document.getElementById('cond_marker_sel'), n.marker_id);
+  document.getElementById('cond_m_op').value = n.marker_op || 'eq';
+  document.getElementById('cond_m_value').value = n.marker_cmp || '';
   onCondTypeChange();
 }
 
@@ -1485,6 +1773,14 @@ function readCondFields(n, errEl){
     if (mode === 'between' && !to) return fail('Bitte Start- und Enddatum angeben.');
     n.date_mode = mode; n.date_from = from; if (mode === 'between') n.date_to = to;
     n.date_yearly = document.getElementById('date_yearly').checked;
+  } else if (t === 'marker'){
+    const mid = document.getElementById('cond_marker_sel').value;
+    if (!mid) return fail('Bitte einen Merker auswählen (zuerst einen Merker-Block platzieren).');
+    const op = document.getElementById('cond_m_op').value;
+    const val = document.getElementById('cond_m_value').value;
+    if (['gt','gte','lt','lte'].includes(op) && isNaN(parseFloat(val.replace(',', '.'))))
+      return fail('Für Größer-/Kleiner-Vergleiche bitte eine Zahl angeben.');
+    n.marker_id = mid; n.marker_op = op; n.marker_cmp = val;
   } else {
     n.operator = document.getElementById('cond_op').value;
     n.compare_value = document.getElementById('cond_value').value;
@@ -1511,6 +1807,118 @@ function submitLocation(){
   }
   STATE.location = { lat, lon };
   closeLocationModal(); scheduleSave(); toast('Standort gespeichert.');
+}
+
+// ---------------- Merker ----------------
+function nextMarkerName(){
+  let i = 1;
+  while (STATE.nodes.some(n => n.type === 'marker' && (n.label || '').toLowerCase() === ('Merker ' + i).toLowerCase())) i++;
+  return 'Merker ' + i;
+}
+function fillMarkerSelect(sel, selectedId){
+  const ms = STATE.nodes.filter(n => n.type === 'marker');
+  sel.innerHTML = ms.length
+    ? ms.map(m => `<option value="${m.id}" ${m.id === selectedId ? 'selected' : ''}>${escapeHtml(m.label || 'Merker')}</option>`).join('')
+    : `<option value="">-- zuerst einen Merker-Block platzieren --</option>`;
+}
+function markerActionText(n){
+  const v = escapeHtml(n.marker_value ?? '');
+  return ({ set: `setzen auf ${v}`, toggle: 'umschalten', inc: `+ ${v || 1}`, dec: `- ${v || 1}`,
+            reset: 'auf Startwert' })[n.marker_action || 'set'] || '';
+}
+function markerSummary(n){
+  const cur = MARKER_VALUES[n.id];
+  return `Wert: <b class="marker-val" data-id="${n.id}">${escapeHtml(cur ?? n.marker_initial ?? '')}</b><br>Aktion: <b>${markerActionText(n)}</b>`;
+}
+function delaySummary(n){
+  if (n.delay_source === 'marker'){
+    const m = nodeById(n.delay_marker_id);
+    const unit = ({ ms:'ms', s:'s', min:'min', h:'h' })[n.delay_marker_unit] || 's';
+    return `Dauer: Merker <b>${escapeHtml(m ? (m.label || 'Merker') : '(gelöscht)')}</b> [${unit}]`;
+  }
+  return `Dauer: <b>${escapeHtml(n.delay_sec)} s</b>`;
+}
+function updateMarkerValues(){
+  document.querySelectorAll('.marker-val').forEach(el => {
+    const v = MARKER_VALUES[el.dataset.id];
+    if (v !== undefined) el.textContent = v;
+  });
+}
+function warnMarkerUsed(ids){
+  const used = ids.filter(id => {
+    const n = nodeById(id);
+    return n && n.type === 'marker' && STATE.nodes.some(o =>
+      (o.type === 'condition' && o.cond_type === 'marker' && o.marker_id === id) ||
+      (o.type === 'delay' && o.delay_source === 'marker' && o.delay_marker_id === id));
+  });
+  if (used.length) toast('Hinweis: Ein gelöschter Merker wurde noch von einer Bedingung oder Wartezeit verwendet.', false);
+}
+async function editMarkerValue(id, e){
+  e.stopPropagation();
+  const n = nodeById(id);
+  const v = prompt(`Neuer Wert für Merker "${n.label || 'Merker'}":`, MARKER_VALUES[id] ?? '');
+  if (v === null) return;
+  const res = await fetch(`/api/markers/${id}`, { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ value: v }) });
+  if (res.ok){ MARKER_VALUES[id] = v; updateMarkerValues(); toast('Merker gesetzt.'); }
+  else toast('Merker noch nicht gespeichert - bitte kurz warten und erneut versuchen.', false);
+}
+function onMarkerActionChange(){
+  const a = document.getElementById('m_action').value;
+  document.getElementById('m_value_wrap').style.display = (a === 'toggle' || a === 'reset') ? 'none' : 'block';
+  document.getElementById('m_value_lbl').textContent =
+    a === 'set' ? 'Wert ({payload} = zuletzt empfangene Nachricht)' : 'Schrittweite';
+}
+function loadMarkerFields(n){
+  document.getElementById('m_initial').value = n.marker_initial ?? '0';
+  document.getElementById('m_action').value = n.marker_action || 'set';
+  document.getElementById('m_value').value = n.marker_value ?? '1';
+  document.getElementById('m_retain').checked = !!n.marker_retain;
+  onMarkerActionChange();
+}
+function readMarkerFields(n, errEl, prevLabel){
+  const fail = (msg) => { n.label = prevLabel; errEl.textContent = msg; errEl.style.display = 'block'; return false; };
+  if (!n.label) return fail('Bitte einen Namen für den Merker angeben.');
+  if (STATE.nodes.some(o => o.type === 'marker' && o.id !== n.id && (o.label || '').toLowerCase() === n.label.toLowerCase()))
+    return fail('Ein Merker mit diesem Namen existiert bereits.');
+  const action = document.getElementById('m_action').value;
+  const value = document.getElementById('m_value').value;
+  if ((action === 'inc' || action === 'dec') && value.trim() !== '' && isNaN(parseFloat(value.replace(',', '.'))))
+    return fail('Die Schrittweite muss eine Zahl sein.');
+  n.marker_initial = document.getElementById('m_initial').value;
+  n.marker_action = action;
+  n.marker_value = value;
+  n.marker_retain = document.getElementById('m_retain').checked;
+  return true;
+}
+
+// ---------------- Wartezeit ----------------
+function onDelaySourceChange(){
+  const src = document.getElementById('delay_source').value;
+  document.getElementById('delay_marker_wrap').style.display = (src === 'marker') ? 'block' : 'none';
+  document.getElementById('delay_sec_lbl').textContent =
+    (src === 'marker') ? 'Ersatzwert in Sekunden (falls der Merker-Wert ungültig ist)' : 'Wartezeit (Sekunden)';
+}
+function loadDelayFields(n){
+  document.getElementById('delay_source').value = n.delay_source || 'fixed';
+  document.getElementById('delay_sec').value = n.delay_sec ?? 1.0;
+  fillMarkerSelect(document.getElementById('delay_marker'), n.delay_marker_id);
+  document.getElementById('delay_unit').value = n.delay_marker_unit || 's';
+  onDelaySourceChange();
+}
+function readDelayFields(n, errEl){
+  const src = document.getElementById('delay_source').value;
+  const fixed = parseFloat(document.getElementById('delay_sec').value) || 0;
+  if (src === 'marker'){
+    const mid = document.getElementById('delay_marker').value;
+    if (!mid){
+      errEl.textContent = 'Bitte einen Merker auswählen (zuerst einen Merker-Block platzieren).';
+      errEl.style.display = 'block'; return false;
+    }
+    n.delay_marker_id = mid; n.delay_marker_unit = document.getElementById('delay_unit').value;
+  }
+  n.delay_sec = fixed; n.delay_source = src;
+  return true;
 }
 
 // ---------------- Broker-Modal ----------------

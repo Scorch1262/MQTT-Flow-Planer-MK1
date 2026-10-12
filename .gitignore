@@ -1,6 +1,8 @@
 # Laufzeit-/Nutzerdaten (enthalten ggf. Broker-Zugangsdaten - nicht versionieren)
 config.json
 config.json.tmp
+markers.json
+markers.json.tmp
 
 # Python
 __pycache__/

@@ -7,7 +7,7 @@ Blockschaltbild zu entwerfen - Bloecke werden per Klick auf die
 Zeichenflaeche gelegt, per Drag & Drop positioniert und durch Linien zu
 einem Ablauf verschaltet (aehnlich Node-RED).
 
-**Aktuelle Version: v1.3.0**
+**Aktuelle Version: v1.4.0**
 
 ## Bloecke
 
@@ -15,8 +15,9 @@ einem Ablauf verschaltet (aehnlich Node-RED).
 |-------------------|-----------|
 | **MQTT Empfangen** | Ereignis/Trigger: abonniert ein Topic bei einem Broker, startet den Ablauf bei ankommender Nachricht (optional nur bei exakt passender Payload). |
 | **MQTT Senden**     | Aktion: veroeffentlicht eine Nachricht auf einem Topic. `{payload}` im Text wird durch die zuletzt empfangene Nachricht des ausloesenden Ereignisses ersetzt. |
-| **Wartezeit**       | Pausiert den Ablauf fuer eine einstellbare Dauer (Sekunden). |
-| **Bedingung**       | Verzweigt nach "Ja"/"Nein". Pruefbar sind: **Nachrichteninhalt** (`=`, `≠`, "enthaelt", `>`, `<`), **Uhrzeit** (zwischen/ab/vor, auch ueber Mitternacht), **Sonne aufgegangen/untergegangen** (optional mit Minuten-Versatz), **Wochentag** (Mehrfachauswahl) und **Datum** (einzeln oder Zeitraum, optional jaehrlich wiederkehrend). |
+| **Wartezeit**       | Pausiert den Ablauf fuer eine einstellbare Dauer - als Festwert oder aus dem Wert eines **Merkers** (Einheit waehlbar: ms, s, min, h; bei ungueltigem Merker-Wert greift ein Ersatzwert). |
+| **Merker**          | Speichert einen Wert (Text oder Zahl, wie ein Merker in einer SPS). Laeuft ein Ablauf in den Block, wird seine Aktion ausgefuehrt: setzen (`{payload}` = zuletzt empfangene Nachricht), umschalten (0/1), hoch-/herunterzaehlen oder auf den Startwert zuruecksetzen. |
+| **Bedingung**       | Verzweigt nach "Ja"/"Nein". Pruefbar sind: **Nachrichteninhalt** (`=`, `≠`, "enthaelt", `>`, `<`), **Uhrzeit** (zwischen/ab/vor, auch ueber Mitternacht), **Sonne aufgegangen/untergegangen** (optional mit Minuten-Versatz), **Wochentag** (Mehrfachauswahl), **Datum** (einzeln oder Zeitraum, optional jaehrlich wiederkehrend) und **Merker** (Vergleich mit dem aktuellen Merker-Wert: `=`, `≠`, `>`, `≥`, `<`, `≤`, "enthaelt", "ist wahr/falsch"). |
 
 Bedienung:
 - **Block platzieren:** links in der Palette anklicken.
@@ -34,6 +35,8 @@ Bedienung:
   ein Ereignis simuliert, ohne auf eine echte Nachricht zu warten; ein
   "MQTT Senden"-Block hat im Bearbeiten-Dialog einen "Jetzt senden
   (Test)"-Knopf.
+
+**Merker:** Der aktuelle Wert wird live im Block angezeigt; mit dem ✎-Knopf laesst er sich von Hand setzen (z. B. zum Testen). Wird der Startwert im Dialog geaendert, gilt er sofort. Mit der Option "Wert nach einem Neustart behalten" wird der Wert in `markers.json` (neben `config.json`) gespeichert - bei sehr haeufigen Aenderungen (mehrmals pro Sekunde) besser nicht remanent verwenden, um den Speicher des Geraets zu schonen. Wahr sind die Werte `1`, `true`, `on`, `an`, `ein`, `ja`, `yes`, `wahr`.
 
 Fuer die Sonnen-Bedingung den **Standort** (Knopf oben rechts) einstellen - Auf-/Untergang werden lokal berechnet (keine Internetverbindung noetig). Uhrzeit, Wochentag, Datum und Sonne verwenden die **Zeitzone des Rechners/Routers**.
 
