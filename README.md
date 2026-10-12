@@ -7,7 +7,7 @@ Blockschaltbild zu entwerfen - Bloecke werden per Klick auf die
 Zeichenflaeche gelegt, per Drag & Drop positioniert und durch Linien zu
 einem Ablauf verschaltet (aehnlich Node-RED).
 
-**Aktuelle Version: v1.2.0**
+**Aktuelle Version: v1.3.0**
 
 ## Bloecke
 
@@ -21,6 +21,11 @@ einem Ablauf verschaltet (aehnlich Node-RED).
 Bedienung:
 - **Block platzieren:** links in der Palette anklicken.
 - **Verschieben:** am Blockkopf ziehen.
+- **Mehrere Bloecke:** auf leerer Flaeche einen Rahmen aufziehen - alle beruehrten
+  Bloecke werden markiert und lassen sich gemeinsam am Kopf eines markierten Blocks
+  verschieben. Umschalt/Strg + Klick auf einen Blockkopf fuegt einen Block zur Auswahl
+  hinzu bzw. entfernt ihn (auch beim Rahmenziehen: bisherige Auswahl bleibt erhalten),
+  Strg+A waehlt alle, Esc hebt die Auswahl auf, Entf loescht alle markierten Bloecke.
 - **Verbinden:** am rechten Punkt (Ausgang) ziehen und auf dem linken
   Punkt (Eingang) eines anderen Blocks loslassen.
 - **Bearbeiten:** auf den Blockinhalt klicken.

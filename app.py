@@ -37,7 +37,7 @@ Erreichbar unter:      http://<IP-DES-PCS>:8020  (im gesamten LAN)
 #   PATCH (x.x.+1) -> Bugfix, keine neuen Funktionen
 #   MINOR (x.+1.0) -> neue Funktion, abwaertskompatibel
 #   MAJOR (+1.0.0) -> Breaking Change (z. B. Config-Format aendert sich)
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 import os
 import sys
@@ -300,6 +300,16 @@ def evaluate_condition(node, payload_ctx, location, now=None):
 # MQTT: einmaliges Veroeffentlichen (kurzlebige Verbindung pro Aufruf, damit
 # gleichzeitig laufende Ablaeufe sich nicht gegenseitig blockieren koennen)
 # --------------------------------------------------------------------------
+def make_mqtt_client(client_id):
+    """Erzeugt einen MQTT-Client und funktioniert sowohl mit paho-mqtt 2.x
+    als auch mit aelteren 1.x-Versionen (z. B. aus den opkg-Paketen von
+    OpenWrt/GL.iNet-Routern)."""
+    if hasattr(mqtt, "CallbackAPIVersion"):
+        return mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                           client_id=client_id, protocol=mqtt.MQTTv311)
+    return mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv311)
+
+
 def mqtt_publish_once(broker: dict, topic: str, payload: str, qos: int = 0,
                        retain: bool = False, timeout: float = 5.0) -> None:
     if not MQTT_AVAILABLE:
@@ -310,10 +320,7 @@ def mqtt_publish_once(broker: dict, topic: str, payload: str, qos: int = 0,
 
     done = threading.Event()
     result = {"error": None}
-    client = mqtt.Client(
-        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-        client_id=f"flow-{uuid.uuid4().hex[:8]}", protocol=mqtt.MQTTv311
-    )
+    client = make_mqtt_client(f"flow-{uuid.uuid4().hex[:8]}")
 
     if broker.get("username"):
         client.username_pw_set(broker.get("username"), broker.get("password") or None)
@@ -322,14 +329,14 @@ def mqtt_publish_once(broker: dict, topic: str, payload: str, qos: int = 0,
         client.tls_set_context(ctx)
         client.tls_insecure_set(True)
 
-    def on_connect(c, userdata, flags, reason_code, properties):
+    def on_connect(c, userdata, flags, reason_code=None, properties=None):
         if reason_code == 0:
             c.publish(topic, payload, qos=qos, retain=retain)
         else:
             result["error"] = f"Verbindung zum Broker fehlgeschlagen ({reason_code})"
             done.set()
 
-    def on_publish(c, userdata, mid, reason_code, properties):
+    def on_publish(c, userdata, mid, reason_code=None, properties=None):
         done.set()
 
     client.on_connect = on_connect
@@ -393,7 +400,11 @@ class FlowEngine:
                 if not broker:
                     continue
                 if bid not in self._clients:
-                    self._start_client(bid, broker)
+                    try:
+                        self._start_client(bid, broker)
+                    except Exception as exc:  # noqa: BLE001 - Webseite soll trotzdem starten
+                        self.log_event(f"Fehler beim Start der MQTT-Verbindung "
+                                       f"'{broker.get('name', bid)}': {exc}")
                 else:
                     topics = {n["topic"] for n in in_nodes if n["broker_id"] == bid}
                     for t in topics:
@@ -405,10 +416,7 @@ class FlowEngine:
     def _start_client(self, bid: str, broker: dict) -> None:
         if not MQTT_AVAILABLE:
             return
-        client = mqtt.Client(
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-            client_id=f"engine-{bid}-{uuid.uuid4().hex[:6]}", protocol=mqtt.MQTTv311
-        )
+        client = make_mqtt_client(f"engine-{bid}-{uuid.uuid4().hex[:6]}")
         if broker.get("username"):
             client.username_pw_set(broker.get("username"), broker.get("password") or None)
         if broker.get("tls"):
@@ -416,7 +424,7 @@ class FlowEngine:
             client.tls_set_context(ctx)
             client.tls_insecure_set(True)
 
-        def on_connect(c, userdata, flags, reason_code, properties):
+        def on_connect(c, userdata, flags, reason_code=None, properties=None):
             if reason_code == 0:
                 cfg = load_config()
                 topics = {n["topic"] for n in cfg["nodes"]
@@ -728,6 +736,9 @@ INDEX_HTML = r"""
   table.broker-table th, table.broker-table td{ text-align:left; padding:6px 4px; border-bottom:1px solid var(--border); }
   table.broker-table th{ color:var(--text-dim); font-weight:500; font-size:11px; }
 
+  .canvas{ user-select:none; }
+  .marquee{ position:absolute; border:1px dashed var(--accent); background:#ff914222;
+            pointer-events:none; z-index:20; }
   .wd-row{ display:flex; gap:8px; flex-wrap:wrap; margin-top:4px; }
   .wd-row label{ display:flex; align-items:center; gap:4px; margin:0; font-size:12px; color:var(--text); }
   .wd-row input{ width:auto; }
@@ -760,6 +771,7 @@ INDEX_HTML = r"""
     <h3>Hinweise</h3>
     <div style="font-size:11.5px; color:var(--text-dim); line-height:1.6;">
       Block ziehen: am Kopf anfassen.<br>
+      Mehrere Bloecke: auf leerer Flaeche einen Rahmen aufziehen und die markierten Bloecke gemeinsam am Kopf ziehen. Umschalt/Strg + Klick auf den Kopf fuegt hinzu bzw. entfernt, Strg+A waehlt alle, Esc hebt die Auswahl auf.<br>
       Verbinden: am rechten Punkt ziehen, auf linken Punkt eines anderen Blocks loslassen.<br>
       Bearbeiten: auf den Blockinhalt klicken.<br>
       Loeschen: Block/Linie anklicken, dann &times; bzw. Entf.
@@ -939,7 +951,8 @@ INDEX_HTML = r"""
 
 <script>
 let STATE = { brokers: [], nodes: [], connections: [], location: { lat: 51.1657, lon: 10.4515 } };
-let selectedNodeId = null, selectedConnId = null, editingNodeId = null;
+let selectedIds = new Set(), selectedConnId = null, editingNodeId = null;
+let dragGroup = null, marquee = null;
 let dragNode = null, dragOffset = {x:0,y:0};
 let drawingConn = null; // {fromId, fromPort, x1, y1}
 let saveTimer = null;
@@ -1038,7 +1051,7 @@ function renderNodes(){
   STATE.nodes.forEach(n => {
     const meta = NODE_META[n.type];
     const div = document.createElement('div');
-    div.className = 'flow-node type-' + n.type + (n.id === selectedNodeId ? ' selected' : '');
+    div.className = 'flow-node type-' + n.type + (selectedIds.has(n.id) ? ' selected' : '');
     div.style.left = n.x + 'px'; div.style.top = n.y + 'px';
     div.dataset.id = n.id;
 
@@ -1106,7 +1119,7 @@ function renderConnections(){
     path.setAttribute('stroke', c.id === selectedConnId ? '#ff9142' : '#3ddc9799');
     path.setAttribute('stroke-width', c.id === selectedConnId ? '2.5' : '2');
     path.style.pointerEvents = 'stroke';
-    path.onclick = () => { selectedConnId = c.id; selectedNodeId=null; renderAll(); };
+    path.onclick = () => { selectedConnId = c.id; selectedIds.clear(); renderAll(); };
     svg.appendChild(path);
   });
 }
@@ -1124,39 +1137,109 @@ async function pollLog(){
   } catch(e){}
 }
 
-// ---------------- Verschieben ----------------
+// ---------------- Verschieben & Mehrfachauswahl ----------------
+function setSelection(ids){
+  selectedIds = new Set(ids);
+  document.querySelectorAll('.flow-node').forEach(el => {
+    el.classList.toggle('selected', selectedIds.has(el.dataset.id));
+  });
+}
+
 function startDrag(e, id){
   if (e.target.closest('.node-del')) return; // Klick auf das x: kein Drag
   e.preventDefault();
-  selectedNodeId = id; selectedConnId = null;
-  const n = nodeById(id);
+  selectedConnId = null;
+  if (e.shiftKey || e.ctrlKey || e.metaKey){      // Auswahl umschalten, kein Drag
+    const ids = new Set(selectedIds);
+    if (ids.has(id)) ids.delete(id); else ids.add(id);
+    setSelection(ids); renderConnections();
+    return;
+  }
+  if (!selectedIds.has(id)) setSelection([id]);   // sonst ganze Gruppe behalten
   const wrap = document.getElementById('canvasWrap');
-  dragNode = id;
-  dragOffset = { x: e.clientX + wrap.scrollLeft - n.x, y: e.clientY + wrap.scrollTop - n.y };
-  document.querySelectorAll('.flow-node').forEach(el => el.classList.toggle('selected', el.dataset.id === id));
+  dragGroup = {
+    sx: e.clientX + wrap.scrollLeft, sy: e.clientY + wrap.scrollTop, moved: false,
+    items: [...selectedIds].map(i => nodeById(i)).filter(Boolean).map(n => ({ id: n.id, x: n.x, y: n.y }))
+  };
   renderConnections();
 }
+
+function startMarquee(e){
+  const canvas = document.getElementById('canvas');
+  const rect = canvas.getBoundingClientRect();
+  const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+  const el = document.createElement('div');
+  el.className = 'marquee';
+  canvas.appendChild(el);
+  marquee = { el, x0: e.clientX - rect.left, y0: e.clientY - rect.top,
+              base: additive ? new Set(selectedIds) : new Set() };
+  if (!additive) setSelection([]);
+  selectedConnId = null; renderConnections();
+  updateMarquee(e);
+}
+function updateMarquee(e){
+  const rect = document.getElementById('canvas').getBoundingClientRect();
+  const x1 = e.clientX - rect.left, y1 = e.clientY - rect.top;
+  const x = Math.min(marquee.x0, x1), y = Math.min(marquee.y0, y1);
+  const w = Math.abs(x1 - marquee.x0), h = Math.abs(y1 - marquee.y0);
+  Object.assign(marquee.el.style, { left: x + 'px', top: y + 'px', width: w + 'px', height: h + 'px' });
+  const ids = new Set(marquee.base);
+  document.querySelectorAll('.flow-node').forEach(el => {
+    const l = el.offsetLeft, t = el.offsetTop, r = l + el.offsetWidth, b = t + el.offsetHeight;
+    if (l < x + w && r > x && t < y + h && b > y) ids.add(el.dataset.id);
+  });
+  setSelection(ids);
+}
+function endMarquee(){ marquee.el.remove(); marquee = null; }
+
 document.addEventListener('mousemove', (e) => {
-  if (dragNode){
-    const wrap = document.getElementById('canvasWrap');
-    const n = nodeById(dragNode);
-    if (!n) return;
-    n.x = Math.max(0, e.clientX + wrap.scrollLeft - dragOffset.x);
-    n.y = Math.max(0, e.clientY + wrap.scrollTop - dragOffset.y);
-    const el = document.querySelector(`.flow-node[data-id="${dragNode}"]`);
-    if (el){ el.style.left = n.x+'px'; el.style.top = n.y+'px'; }
+  const wrap = document.getElementById('canvasWrap');
+  if (dragGroup){
+    let dx = e.clientX + wrap.scrollLeft - dragGroup.sx;
+    let dy = e.clientY + wrap.scrollTop - dragGroup.sy;
+    dx = Math.max(dx, -Math.min(...dragGroup.items.map(i => i.x)));   // nicht ueber den Rand schieben
+    dy = Math.max(dy, -Math.min(...dragGroup.items.map(i => i.y)));
+    dragGroup.items.forEach(it => {
+      const n = nodeById(it.id);
+      if (!n) return;
+      n.x = it.x + dx; n.y = it.y + dy;
+      const el = document.querySelector(`.flow-node[data-id="${it.id}"]`);
+      if (el){ el.style.left = n.x + 'px'; el.style.top = n.y + 'px'; }
+    });
+    if (dx !== 0 || dy !== 0) dragGroup.moved = true;
     renderConnections();
   }
+  if (marquee) updateMarquee(e);
   if (drawingConn){
-    const wrap = document.getElementById('canvasWrap');
     const rect = document.getElementById('canvas').getBoundingClientRect();
     drawingConn.x2 = e.clientX - rect.left; drawingConn.y2 = e.clientY - rect.top;
     drawTempLine();
   }
 });
 document.addEventListener('mouseup', () => {
-  if (dragNode){ dragNode = null; scheduleSave(); }
+  if (dragGroup){ const moved = dragGroup.moved; dragGroup = null; if (moved) scheduleSave(); }
+  if (marquee) endMarquee();
 });
+
+document.addEventListener('keydown', (e) => {
+  const tag = document.activeElement.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+  if (document.querySelector('.modal-backdrop.show')) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a'){
+    e.preventDefault(); setSelection(STATE.nodes.map(n => n.id));
+  } else if (e.key === 'Escape'){
+    setSelection([]); selectedConnId = null; renderConnections();
+  }
+});
+
+function deleteSelected(){
+  const ids = new Set(selectedIds);
+  if (!ids.size) return;
+  STATE.nodes = STATE.nodes.filter(n => !ids.has(n.id));
+  STATE.connections = STATE.connections.filter(c => !ids.has(c.from) && !ids.has(c.to));
+  selectedIds.clear();
+  renderAll(); scheduleSave();
+}
 
 // ---------------- Verbinden ----------------
 function startConn(nodeId, port, e){
@@ -1197,13 +1280,19 @@ document.getElementById('canvasWrap').addEventListener('mouseup', () => {
   }
 });
 document.getElementById('canvasWrap').addEventListener('mousedown', (e) => {
-  if (e.target.id === 'canvasWrap' || e.target.id === 'canvas'){ selectedNodeId=null; selectedConnId=null; renderAll(); }
+  if (e.button !== 0) return;
+  if (e.target.id !== 'canvasWrap' && e.target.id !== 'canvas') return;
+  const wrap = e.currentTarget, r = wrap.getBoundingClientRect();
+  if (e.clientX > r.left + wrap.clientWidth || e.clientY > r.top + wrap.clientHeight) return; // Scrollbalken
+  e.preventDefault();
+  startMarquee(e);
 });
 
 document.addEventListener('keydown', (e) => {
   if ((e.key === 'Delete' || e.key === 'Backspace') && document.activeElement.tagName !== 'INPUT'
       && document.activeElement.tagName !== 'TEXTAREA'){
-    if (selectedNodeId){ deleteNode(selectedNodeId); }
+    if (document.querySelector('.modal-backdrop.show')) return;
+    if (selectedIds.size){ deleteSelected(); }
     else if (selectedConnId){ deleteConnById(selectedConnId); }
   }
 });
@@ -1212,7 +1301,7 @@ function deleteNode(id, e){
   if (e) e.stopPropagation();
   STATE.nodes = STATE.nodes.filter(n => n.id !== id);
   STATE.connections = STATE.connections.filter(c => c.from !== id && c.to !== id);
-  if (selectedNodeId === id) selectedNodeId = null;
+  selectedIds.delete(id);
   renderAll(); scheduleSave();
 }
 function deleteConnById(id){
@@ -1481,7 +1570,10 @@ setInterval(pollLog, 2000);
 # --------------------------------------------------------------------------
 def main():
     cfg = load_config()
-    ENGINE.rebuild(cfg)
+    try:
+        ENGINE.rebuild(cfg)
+    except Exception as exc:  # noqa: BLE001
+        print(f" [WARNUNG] MQTT-Engine konnte nicht gestartet werden: {exc}")
     host = cfg["server"].get("host", "0.0.0.0")
     port = int(cfg["server"].get("port", 8020))
     print("=" * 64)
