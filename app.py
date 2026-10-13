@@ -26,6 +26,14 @@ Block-Typen:
     koennen den Wert auswerten, Wartezeiten ihn als Dauer verwenden. Auf
     Wunsch bleibt der Wert nach einem Neustart erhalten (markers.json).
 
+  - UND / ODER: verknuepfen mehrere Bedingungen. Die Ergebnis-Ausgaenge
+    von Bedingungen (oder anderen UND/ODER-Elementen) werden ueber
+    gestrichelte Datenlinien mit dem Eingang des UND/ODER-Elements
+    verbunden. Erreicht der Ablauf das Element, werden alle Eingaenge
+    ausgewertet; der Ablauf geht bei UND ueber "Ja" weiter, wenn alle
+    Eingaenge Ja sind, bei ODER, wenn mindestens einer Ja ist - sonst
+    ueber "Nein".
+
 Die komplette Verschaltung (Broker, Bloecke, Verbindungen, Ansicht)
 wird menschenlesbar in "config.json" gespeichert, die im selben
 Verzeichnis wie das Skript / die exe liegt - Handbearbeitung bleibt
@@ -43,7 +51,7 @@ Erreichbar unter:      http://<IP-DES-PCS>:8020  (im gesamten LAN)
 #   PATCH (x.x.+1) -> Bugfix, keine neuen Funktionen
 #   MINOR (x.+1.0) -> neue Funktion, abwaertskompatibel
 #   MAJOR (+1.0.0) -> Breaking Change (z. B. Config-Format aendert sich)
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 import os
 import sys
@@ -118,6 +126,9 @@ def load_config() -> dict:
     cfg.setdefault("nodes", [])
     cfg.setdefault("connections", [])
     cfg.setdefault("location", copy.deepcopy(DEFAULT_CONFIG["location"]))
+    for c in cfg["connections"]:
+        c.setdefault("from_port", "out")
+        c.setdefault("to_port", "in")   # "data" = Datenlinie zu einem UND/ODER-Element
 
     for b in cfg["brokers"]:
         b.setdefault("port", 1883)
@@ -359,6 +370,38 @@ def evaluate_condition(node, payload_ctx, location, now=None, markers=None):
 # MQTT: einmaliges Veroeffentlichen (kurzlebige Verbindung pro Aufruf, damit
 # gleichzeitig laufende Ablaeufe sich nicht gegenseitig blockieren koennen)
 # --------------------------------------------------------------------------
+def evaluate_gate(node, payload_ctx, location, nodes_by_id, connections, markers, _stack=None):
+    """Wertet ein UND/ODER-Element aus. Gibt (ergebnis, details) zurueck;
+    details ist eine Liste aus (Name, Ja/Nein) je verbundenem Eingang.
+    Eingaenge sind Bedingungen oder weitere UND/ODER-Elemente, die ueber
+    Datenlinien (to_port == "data") angeschlossen sind. Ohne Eingaenge ist
+    das Ergebnis Nein; Kreise zwischen Elementen werden als Nein gewertet."""
+    stack = set(_stack or ()) | {node["id"]}
+    details = []
+    for c in connections:
+        if c.get("to") != node["id"] or c.get("to_port") != "data":
+            continue
+        src = nodes_by_id.get(c.get("from"))
+        if not src or src["id"] in stack:
+            if src:
+                details.append((src.get("label") or "Kreis", False))
+            continue
+        if src["type"] == "condition":
+            name = src.get("label") or ("Bedingung " + COND_LABELS.get(src.get("cond_type", "payload"), ""))
+            result = evaluate_condition(src, payload_ctx, location, markers=markers)
+        elif src["type"] in ("and", "or"):
+            name = src.get("label") or ("UND" if src["type"] == "and" else "ODER")
+            result, _sub = evaluate_gate(src, payload_ctx, location, nodes_by_id, connections, markers, stack)
+        else:
+            continue
+        details.append((name, result))
+    if not details:
+        return False, []
+    values = [r for _name, r in details]
+    ok = all(values) if node["type"] == "and" else any(values)
+    return ok, details
+
+
 def make_mqtt_client(client_id):
     """Erzeugt einen MQTT-Client und funktioniert sowohl mit paho-mqtt 2.x
     als auch mit aelteren 1.x-Versionen (z. B. aus den opkg-Paketen von
@@ -649,7 +692,8 @@ class FlowEngine:
                    cfg["connections"], visited)
 
     def _walk(self, node_id, from_port, payload_ctx, nodes_by_id, brokers_by_id, connections, visited):
-        edges = [c for c in connections if c["from"] == node_id and c.get("from_port", "out") == from_port]
+        edges = [c for c in connections if c["from"] == node_id and c.get("from_port", "out") == from_port
+                 and c.get("to_port", "in") != "data"]
         for edge in edges:
             target = nodes_by_id.get(edge["to"])
             if not target:
@@ -658,12 +702,13 @@ class FlowEngine:
             if guard in visited:
                 continue  # einfache Zyklen-Bremse
             visited.add(guard)
-            next_port = self._execute(target, payload_ctx, brokers_by_id)
+            next_port = self._execute(target, payload_ctx, brokers_by_id, nodes_by_id, connections)
             payload_ctx = self._last_payload if hasattr(self, "_last_payload") else payload_ctx
             if next_port:
                 self._walk(target["id"], next_port, payload_ctx, nodes_by_id, brokers_by_id, connections, visited)
 
-    def _execute(self, node: dict, payload_ctx: str, brokers_by_id: dict) -> str:
+    def _execute(self, node: dict, payload_ctx: str, brokers_by_id: dict,
+                 nodes_by_id: dict = None, connections: list = None) -> str:
         """Fuehrt einen einzelnen Block aus und gibt den Ausgangs-Port
         zurueck, ueber den der Ablauf weitergehen soll ("out", "true",
         "false") - oder None, um den Zweig zu beenden."""
@@ -690,6 +735,19 @@ class FlowEngine:
                 ctype = node.get("cond_type", "payload")
                 self.log_event(f"Bedingung '{node.get('label') or node['id']}' "
                                f"({COND_LABELS.get(ctype, ctype)}): {'Ja' if ok else 'Nein'}")
+                return "true" if ok else "false"
+
+            if ntype in ("and", "or"):
+                ok, details = evaluate_gate(node, payload_ctx, load_config().get("location") or {},
+                                            nodes_by_id or {}, connections or [], self.get_markers())
+                title = "UND" if ntype == "and" else "ODER"
+                name = node.get("label") or title
+                answer = "Ja" if ok else "Nein"
+                if details:
+                    parts = "; ".join(d_name + "=" + ("Ja" if d_res else "Nein") for d_name, d_res in details)
+                    self.log_event(f"{title} '{name}' ({parts}): {answer}")
+                else:
+                    self.log_event(f"{title} '{name}': keine Eingaenge verbunden - Ergebnis Nein")
                 return "true" if ok else "false"
 
             if ntype == "marker":
@@ -860,7 +918,7 @@ INDEX_HTML = r"""
   .pal-dot{ width:9px; height:9px; border-radius:50%; flex-shrink:0; }
   .dot-in{ background:var(--accent-2); } .dot-out{ background:var(--accent); }
   .dot-delay{ background:var(--text-dim); } .dot-cond{ background:var(--accent-3); }
-  .dot-marker{ background:#4cc9f0; }
+  .dot-marker{ background:#4cc9f0; } .dot-gate{ background:#f4d35e; }
 
   .canvas-wrap{ flex:1; position:relative; overflow:auto; background:
     radial-gradient(circle, #1c212a 1px, transparent 1px) 0 0/22px 22px, var(--bg); }
@@ -876,6 +934,7 @@ INDEX_HTML = r"""
   .flow-node.type-delay{ border-left:4px solid var(--text-dim); }
   .flow-node.type-condition{ border-left:4px solid var(--accent-3); }
   .flow-node.type-marker{ border-left:4px solid #4cc9f0; }
+  .flow-node.type-and, .flow-node.type-or{ border-left:4px solid #f4d35e; }
   .node-head{ display:flex; align-items:center; justify-content:space-between; padding:8px 10px;
               background:var(--panel-2); border-bottom:1px solid var(--border); border-radius:8px 8px 0 0;
               cursor:grab; font-size:12px; font-weight:600; }
@@ -898,6 +957,9 @@ INDEX_HTML = r"""
   .port-label{ position:absolute; font-family:var(--mono); font-size:9px; color:var(--text-dim); }
   .port-label.true{ right:14px; top:28%; color:var(--accent-2); }
   .port-label.false{ right:14px; top:60%; color:var(--danger); }
+  .port-data-in, .port-data-out{ border-radius:2px; border-color:#4cc9f0; transform:rotate(45deg); }
+  .port-data-in{ left:50%; top:-6px; margin-left:-5.5px; }
+  .port-data-out{ left:75%; bottom:-6px; margin-left:-5.5px; }
 
   .side{ width:270px; border-left:1px solid var(--border); background:var(--panel); padding:14px;
          overflow-y:auto; flex-shrink:0; }
@@ -964,13 +1026,16 @@ INDEX_HTML = r"""
     <div class="pal-item" onclick="addNode('delay')"><span class="pal-dot dot-delay"></span>Wartezeit</div>
     <div class="pal-item" onclick="addNode('condition')"><span class="pal-dot dot-cond"></span>Bedingung</div>
     <div class="pal-item" onclick="addNode('marker')"><span class="pal-dot dot-marker"></span>Merker</div>
+    <div class="pal-item" onclick="addNode('and')"><span class="pal-dot dot-gate"></span>UND</div>
+    <div class="pal-item" onclick="addNode('or')"><span class="pal-dot dot-gate"></span>ODER</div>
     <h3>Hinweise</h3>
     <div style="font-size:11.5px; color:var(--text-dim); line-height:1.6;">
       Block ziehen: am Kopf anfassen.<br>
       Mehrere Bloecke: auf leerer Flaeche einen Rahmen aufziehen und die markierten Bloecke gemeinsam am Kopf ziehen. Umschalt/Strg + Klick auf den Kopf fuegt hinzu bzw. entfernt, Strg+A waehlt alle, Esc hebt die Auswahl auf.<br>
       Verbinden: am rechten Punkt ziehen, auf linken Punkt eines anderen Blocks loslassen.<br>
       Bearbeiten: auf den Blockinhalt klicken.<br>
-      Merker: speichert einen Wert; Bedingungen und Wartezeiten koennen ihn verwenden.<br>
+      Merker: speichert einen Wert; Bedingungen und Wartezeiten koennen ihn verwenden. Die Verbindung zeigt eine gestrichelte Linie automatisch.<br>
+      UND/ODER: den Ergebnis-Ausgang (&#9670; unten) von Bedingungen auf den Eingang (&#9670; oben) ziehen; der Ablauf geht dann ueber Ja/Nein weiter.<br>
       Loeschen: Block/Linie anklicken, dann &times; bzw. Entf.
     </div>
   </div>
@@ -1139,6 +1204,8 @@ INDEX_HTML = r"""
         <div class="checkbox-line"><input type="checkbox" id="date_yearly"><label style="margin:0;">jährlich wiederkehrend (Jahr ignorieren)</label></div>
       </div>
     </div>
+    <div id="fields_and"><div class="hint" style="margin-top:0;">UND: Der Ablauf geht über „Ja“ weiter, wenn <b>alle</b> verbundenen Eingänge Ja ergeben, sonst über „Nein“. Verbinden: Ergebnis-Ausgang (&#9670; unten) einer Bedingung auf den Eingang (&#9670; oben) dieses Elements ziehen.</div></div>
+    <div id="fields_or"><div class="hint" style="margin-top:0;">ODER: Der Ablauf geht über „Ja“ weiter, wenn <b>mindestens ein</b> verbundener Eingang Ja ergibt, sonst über „Nein“. Verbinden: Ergebnis-Ausgang (&#9670; unten) einer Bedingung auf den Eingang (&#9670; oben) dieses Elements ziehen.</div></div>
     <div id="fields_marker">
       <div class="hint" style="margin-top:0;">Ein Merker speichert einen Wert. Läuft ein Ablauf in diesen Block, wird die Aktion ausgeführt. Bedingungen und Wartezeiten können den Wert verwenden. Die Bezeichnung oben ist der Name des Merkers.</div>
       <label>Startwert</label>
@@ -1232,8 +1299,10 @@ const NODE_META = {
   mqtt_in:    { title: 'MQTT Empfangen', hasIn:false, outs:['out'] },
   mqtt_out:   { title: 'MQTT Senden',    hasIn:true,  outs:['out'] },
   delay:      { title: 'Wartezeit',      hasIn:true,  outs:['out'] },
-  condition:  { title: 'Bedingung',      hasIn:true,  outs:['true','false'] },
+  condition:  { title: 'Bedingung',      hasIn:true,  outs:['true','false'], dataOut:true },
   marker:     { title: 'Merker',         hasIn:true,  outs:['out'] },
+  and:        { title: 'UND',            hasIn:true,  outs:['true','false'], dataIn:true, dataOut:true },
+  or:         { title: 'ODER',           hasIn:true,  outs:['true','false'], dataIn:true, dataOut:true },
 };
 
 async function loadVersion(){
@@ -1305,6 +1374,7 @@ function nodeSummary(n){
   if (n.type === 'delay') return delaySummary(n);
   if (n.type === 'condition') return condSummary(n);
   if (n.type === 'marker') return markerSummary(n);
+  if (n.type === 'and' || n.type === 'or') return gateSummary(n);
   return '';
 }
 function opLabel(op){
@@ -1334,7 +1404,7 @@ function renderNodes(){
     if (meta.hasIn){
       const p = document.createElement('div');
       p.className='port port-in'; p.dataset.node=n.id; p.dataset.port='in';
-      p.onmouseup = (e)=>finishConn(n.id, e);
+      p.onmouseup = (e)=>finishConn(n.id, e, 'in');
       div.appendChild(p);
     }
     if (meta.outs.length === 1){
@@ -1354,6 +1424,20 @@ function renderNodes(){
         div.appendChild(lbl);
       });
     }
+    if (meta.dataIn){
+      const p = document.createElement('div');
+      p.className = 'port port-data-in'; p.dataset.node = n.id; p.dataset.port = 'data';
+      p.title = 'Eingänge: Ergebnisse von Bedingungen bzw. UND/ODER-Elementen';
+      p.onmouseup = (e) => finishConn(n.id, e, 'data');
+      div.appendChild(p);
+    }
+    if (meta.dataOut){
+      const p = document.createElement('div');
+      p.className = 'port port-data-out'; p.dataset.node = n.id; p.dataset.port = 'result';
+      p.title = 'Ergebnis (Ja/Nein) mit dem Eingang eines UND/ODER-Elements verbinden';
+      p.onmousedown = (e) => startConn(n.id, 'result', e);
+      div.appendChild(p);
+    }
     canvas.appendChild(div);
   });
 }
@@ -1363,6 +1447,8 @@ function nodePortPos(nodeId, port){
   if (!el) return {x:0,y:0};
   const w = el.offsetWidth, h = el.offsetHeight;
   const x = el.offsetLeft, y = el.offsetTop;
+  if (port === 'data') return {x: x + w*0.5, y: y};
+  if (port === 'result') return {x: x + w*0.75, y: y + h};
   if (port === 'in') return {x: x, y: y + h/2};
   if (port === 'true') return {x: x + w, y: y + h*0.34};
   if (port === 'false') return {x: x + w, y: y + h*0.66};
@@ -1374,17 +1460,77 @@ function pathBetween(p1, p2){
   return `M ${p1.x} ${p1.y} C ${p1.x+dx} ${p1.y}, ${p2.x-dx} ${p2.y}, ${p2.x} ${p2.y}`;
 }
 
+function pathVertical(p1, p2, dir){
+  const dy = Math.max(30, Math.abs(p2.y - p1.y) / 2) * (dir || 1);
+  return `M ${p1.x} ${p1.y} C ${p1.x} ${p1.y + dy}, ${p2.x} ${p2.y - dy}, ${p2.x} ${p2.y}`;
+}
+function svgEl(tag, attrs){
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+function nodeBox(id){
+  const el = document.querySelector(`.flow-node[data-id="${id}"]`);
+  return el ? { x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight } : null;
+}
+// Bedingungen und Wartezeiten, die den Wert eines Merkers auswerten
+function markerReferences(){
+  const refs = [];
+  STATE.nodes.forEach(n => {
+    if (n.type === 'condition' && n.cond_type === 'marker' && n.marker_id) refs.push({ marker: n.marker_id, target: n.id });
+    if (n.type === 'delay' && n.delay_source === 'marker' && n.delay_marker_id) refs.push({ marker: n.delay_marker_id, target: n.id });
+  });
+  return refs.filter(r => { const m = nodeById(r.marker); return m && m.type === 'marker'; });
+}
+function gateSummary(n){
+  const cnt = STATE.connections.filter(c => c.to === n.id && c.to_port === 'data').length;
+  const rule = n.type === 'and' ? 'Ja, wenn <b>alle</b> Eingänge Ja sind' : 'Ja, wenn <b>mindestens ein</b> Eingang Ja ist';
+  return `${rule}<br>Eingänge: <b>${cnt}</b>`;
+}
+function dataReaches(startId, targetId){
+  const seen = new Set(), stack = [startId];
+  while (stack.length){
+    const cur = stack.pop();
+    if (cur === targetId) return true;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    STATE.connections.forEach(c => { if (c.to_port === 'data' && c.from === cur) stack.push(c.to); });
+  }
+  return false;
+}
+
 function renderConnections(){
   const svg = document.getElementById('connLayer');
   svg.innerHTML = '';
+  const defs = svgEl('defs', {});
+  const arrow = svgEl('marker', { id:'arrowData', viewBox:'0 0 10 10', refX:'9', refY:'5',
+                                  markerWidth:'7', markerHeight:'7', orient:'auto' });
+  arrow.appendChild(svgEl('path', { d:'M 0 1 L 10 5 L 0 9 z', fill:'#4cc9f0' }));
+  defs.appendChild(arrow); svg.appendChild(defs);
+
+  // 1) Merker-Bezuege: entstehen automatisch, sobald eine Bedingung/Wartezeit einen Merker auswertet
+  markerReferences().forEach(r => {
+    const a = nodeBox(r.marker), b = nodeBox(r.target);
+    if (!a || !b) return;
+    const down = (b.y + b.h / 2) >= (a.y + a.h / 2);
+    const p1 = { x: a.x + a.w * 0.5, y: down ? a.y + a.h : a.y };
+    const p2 = { x: b.x + b.w * 0.25, y: down ? b.y : b.y + b.h };
+    const path = svgEl('path', { d: pathVertical(p1, p2, down ? 1 : -1), fill:'none', stroke:'#4cc9f0aa',
+      'stroke-width':'1.6', 'stroke-dasharray':'6,4', 'marker-end':'url(#arrowData)',
+      'data-ref': r.marker + '>' + r.target });
+    path.style.pointerEvents = 'none';
+    svg.appendChild(path);
+  });
+
+  // 2) Ablauflinien (durchgezogen) und Datenlinien zu UND/ODER (gestrichelt)
   STATE.connections.forEach(c => {
+    const isData = c.to_port === 'data';
     const p1 = nodePortPos(c.from, c.from_port || 'out');
-    const p2 = nodePortPos(c.to, 'in');
-    const path = document.createElementNS('http://www.w3.org/2000/svg','path');
-    path.setAttribute('d', pathBetween(p1,p2));
-    path.setAttribute('fill','none');
-    path.setAttribute('stroke', c.id === selectedConnId ? '#ff9142' : '#3ddc9799');
-    path.setAttribute('stroke-width', c.id === selectedConnId ? '2.5' : '2');
+    const p2 = nodePortPos(c.to, isData ? 'data' : 'in');
+    const sel = c.id === selectedConnId;
+    const path = svgEl('path', { d: isData ? pathVertical(p1, p2, 1) : pathBetween(p1, p2), fill:'none',
+      stroke: sel ? '#ff9142' : (isData ? '#4cc9f0cc' : '#3ddc9799'), 'stroke-width': sel ? '2.5' : '2' });
+    if (isData){ path.setAttribute('stroke-dasharray', '6,4'); path.setAttribute('marker-end', 'url(#arrowData)'); }
     path.style.pointerEvents = 'stroke';
     path.onclick = () => { selectedConnId = c.id; selectedIds.clear(); renderAll(); };
     svg.appendChild(path);
@@ -1525,20 +1671,30 @@ function drawTempLine(){
     el.setAttribute('stroke', '#ff9142'); el.setAttribute('stroke-width','2'); el.setAttribute('stroke-dasharray','5,4');
     svg.appendChild(el);
   }
-  el.setAttribute('d', pathBetween({x:drawingConn.x1,y:drawingConn.y1}, {x:drawingConn.x2,y:drawingConn.y2}));
+  const a = {x:drawingConn.x1,y:drawingConn.y1}, b = {x:drawingConn.x2,y:drawingConn.y2};
+  el.setAttribute('d', drawingConn.fromPort === 'result' ? pathVertical(a, b) : pathBetween(a, b));
 }
-function finishConn(targetId, e){
+function finishConn(targetId, e, toPort){
   e.stopPropagation();
   if (!drawingConn) return;
-  if (drawingConn.fromId === targetId){ drawingConn = null; renderConnections(); return; }
-  const exists = STATE.connections.some(c => c.from===drawingConn.fromId && c.from_port===drawingConn.fromPort && c.to===targetId);
+  toPort = toPort || 'in';
+  const isDataLine = drawingConn.fromPort === 'result';
+  const tmp = document.getElementById('tempConnLine');
+  const abort = (msg) => { drawingConn = null; if (tmp) tmp.remove(); renderConnections(); if (msg) toast(msg, false); };
+  if (drawingConn.fromId === targetId) return abort();
+  if (isDataLine !== (toPort === 'data')) return abort(isDataLine
+    ? 'Ergebnis-Ausgänge (unten) lassen sich nur mit den Eingängen (oben) eines UND/ODER-Elements verbinden.'
+    : 'Ablauf-Ausgänge (rechts) lassen sich nur mit Ablauf-Eingängen (links) verbinden.');
+  if (isDataLine && dataReaches(targetId, drawingConn.fromId)) return abort('Diese Verbindung würde einen Kreis bilden.');
+  const exists = STATE.connections.some(c => c.from === drawingConn.fromId && c.from_port === drawingConn.fromPort
+    && c.to === targetId && (c.to_port || 'in') === toPort);
   if (!exists){
-    STATE.connections.push({ id:'conn_'+Math.random().toString(16).slice(2,10),
-      from: drawingConn.fromId, from_port: drawingConn.fromPort, to: targetId });
+    STATE.connections.push({ id:'conn_' + Math.random().toString(16).slice(2,10),
+      from: drawingConn.fromId, from_port: drawingConn.fromPort, to: targetId, to_port: toPort });
     scheduleSave();
   }
   drawingConn = null;
-  const tmp = document.getElementById('tempConnLine'); if (tmp) tmp.remove();
+  if (tmp) tmp.remove();
   renderAll();
 }
 document.getElementById('canvasWrap').addEventListener('mouseup', () => {
@@ -1603,7 +1759,7 @@ function openNodeModal(id){
   document.getElementById('nodeError').style.display = 'none';
   document.getElementById('nodeModalTitle').textContent = NODE_META[n.type].title + ' bearbeiten';
   document.getElementById('n_label').value = n.label || '';
-  ['fields_mqtt_in','fields_mqtt_out','fields_delay','fields_condition','fields_marker'].forEach(id2 => {
+  ['fields_mqtt_in','fields_mqtt_out','fields_delay','fields_condition','fields_marker','fields_and','fields_or'].forEach(id2 => {
     document.getElementById(id2).style.display = (id2 === 'fields_' + n.type) ? 'block' : 'none';
   });
   if (n.type === 'mqtt_in'){

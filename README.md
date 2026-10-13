@@ -7,7 +7,7 @@ Blockschaltbild zu entwerfen - Bloecke werden per Klick auf die
 Zeichenflaeche gelegt, per Drag & Drop positioniert und durch Linien zu
 einem Ablauf verschaltet (aehnlich Node-RED).
 
-**Aktuelle Version: v1.4.0**
+**Aktuelle Version: v1.5.0**
 
 ## Bloecke
 
@@ -17,6 +17,8 @@ einem Ablauf verschaltet (aehnlich Node-RED).
 | **MQTT Senden**     | Aktion: veroeffentlicht eine Nachricht auf einem Topic. `{payload}` im Text wird durch die zuletzt empfangene Nachricht des ausloesenden Ereignisses ersetzt. |
 | **Wartezeit**       | Pausiert den Ablauf fuer eine einstellbare Dauer - als Festwert oder aus dem Wert eines **Merkers** (Einheit waehlbar: ms, s, min, h; bei ungueltigem Merker-Wert greift ein Ersatzwert). |
 | **Merker**          | Speichert einen Wert (Text oder Zahl, wie ein Merker in einer SPS). Laeuft ein Ablauf in den Block, wird seine Aktion ausgefuehrt: setzen (`{payload}` = zuletzt empfangene Nachricht), umschalten (0/1), hoch-/herunterzaehlen oder auf den Startwert zuruecksetzen. |
+| **UND**             | Verknuepft mehrere Bedingungen: Der Ablauf geht ueber "Ja" weiter, wenn **alle** angeschlossenen Eingaenge Ja ergeben, sonst ueber "Nein". |
+| **ODER**            | Wie UND, aber "Ja", sobald **mindestens ein** angeschlossener Eingang Ja ergibt. |
 | **Bedingung**       | Verzweigt nach "Ja"/"Nein". Pruefbar sind: **Nachrichteninhalt** (`=`, `≠`, "enthaelt", `>`, `<`), **Uhrzeit** (zwischen/ab/vor, auch ueber Mitternacht), **Sonne aufgegangen/untergegangen** (optional mit Minuten-Versatz), **Wochentag** (Mehrfachauswahl), **Datum** (einzeln oder Zeitraum, optional jaehrlich wiederkehrend) und **Merker** (Vergleich mit dem aktuellen Merker-Wert: `=`, `≠`, `>`, `≥`, `<`, `≤`, "enthaelt", "ist wahr/falsch"). |
 
 Bedienung:
@@ -37,6 +39,8 @@ Bedienung:
   (Test)"-Knopf.
 
 **Merker:** Der aktuelle Wert wird live im Block angezeigt; mit dem ✎-Knopf laesst er sich von Hand setzen (z. B. zum Testen). Wird der Startwert im Dialog geaendert, gilt er sofort. Mit der Option "Wert nach einem Neustart behalten" wird der Wert in `markers.json` (neben `config.json`) gespeichert - bei sehr haeufigen Aenderungen (mehrmals pro Sekunde) besser nicht remanent verwenden, um den Speicher des Geraets zu schonen. Wahr sind die Werte `1`, `true`, `on`, `an`, `ein`, `ja`, `yes`, `wahr`.
+
+**Linien:** Durchgezogene gruene Linien sind der Ablauf (rechter Ausgang -> linker Eingang). Wertet eine Bedingung oder Wartezeit einen Merker aus, zeichnet das Programm **automatisch** eine gestrichelte, hellblaue Linie vom Merker zu diesem Block (mit Pfeil; sie verschwindet, wenn der Bezug entfaellt). **UND/ODER:** Den Ergebnis-Ausgang (Raute unten) einer Bedingung auf den Eingang (Raute oben) des UND/ODER-Elements ziehen - die gestrichelte Datenlinie laesst sich anklicken und mit Entf loeschen. Mehrere Bedingungen koennen angeschlossen werden, auch UND/ODER-Elemente untereinander (z. B. (A UND B) ODER C); Kreise werden abgelehnt. Das Element wird vom Ablauf erreicht wie eine Bedingung (linker Eingang) und wertet dann alle Eingaenge in diesem Moment aus; ohne angeschlossene Eingaenge ist das Ergebnis "Nein". Das Ereignisprotokoll zeigt je Eingang Ja/Nein.
 
 Fuer die Sonnen-Bedingung den **Standort** (Knopf oben rechts) einstellen - Auf-/Untergang werden lokal berechnet (keine Internetverbindung noetig). Uhrzeit, Wochentag, Datum und Sonne verwenden die **Zeitzone des Rechners/Routers**.
 
