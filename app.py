@@ -51,7 +51,7 @@ Erreichbar unter:      http://<IP-DES-PCS>:8020  (im gesamten LAN)
 #   PATCH (x.x.+1) -> Bugfix, keine neuen Funktionen
 #   MINOR (x.+1.0) -> neue Funktion, abwaertskompatibel
 #   MAJOR (+1.0.0) -> Breaking Change (z. B. Config-Format aendert sich)
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 import os
 import sys
@@ -61,6 +61,7 @@ import time
 import copy
 import uuid
 import math
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -102,6 +103,7 @@ DEFAULT_CONFIG = {
                   "bitte gueltiges JSON beibehalten.",
     "server": {"host": "0.0.0.0", "port": 8020},
     "location": {"lat": 51.1657, "lon": 10.4515},
+    "pages": [{"id": "page_1", "name": "Seite 1"}],
     "brokers": [],
     "nodes": [],
     "connections": []
@@ -129,6 +131,16 @@ def load_config() -> dict:
     for c in cfg["connections"]:
         c.setdefault("from_port", "out")
         c.setdefault("to_port", "in")   # "data" = Datenlinie zu einem UND/ODER-Element
+    # Seiten: jedes Element gehoert zu genau einer Seite (aeltere Dateien: Seite 1)
+    if not isinstance(cfg.get("pages"), list) or not cfg["pages"]:
+        cfg["pages"] = [{"id": "page_1", "name": "Seite 1"}]
+    for p in cfg["pages"]:
+        p.setdefault("id", new_id("page"))
+        p.setdefault("name", "Seite")
+    valid_pages = {p["id"] for p in cfg["pages"]}
+    for n in cfg["nodes"]:
+        if n.get("page") not in valid_pages:
+            n["page"] = cfg["pages"][0]["id"]
 
     for b in cfg["brokers"]:
         b.setdefault("port", 1883)
@@ -251,6 +263,47 @@ def is_sun_up(now, lat, lon, offset_min=0):
     return polar == "day"
 
 
+_PLACEHOLDER = re.compile(r"\{payload(?:\.([^{}]+))?\}")
+
+
+def extract_json_field(payload_text, path):
+    """Liest ein Feld aus einer JSON-Nachricht. path: "temperature",
+    "sensor.temp" oder "werte.0" (Listenindex). Gibt (True, Text) oder
+    (False, Fehlergrund) zurueck."""
+    try:
+        data = json.loads(payload_text)
+    except Exception:
+        return False, "Nachricht ist kein JSON"
+    cur = data
+    for part in [p for p in str(path).strip().split(".") if p != ""]:
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        elif (isinstance(cur, list) and part.lstrip("-").isdigit()
+              and -len(cur) <= int(part) < len(cur)):
+            cur = cur[int(part)]
+        else:
+            return False, f"Feld '{path}' nicht gefunden"
+    if isinstance(cur, bool):
+        return True, "true" if cur else "false"
+    if cur is None:
+        return True, ""
+    if isinstance(cur, (dict, list)):
+        return True, json.dumps(cur, ensure_ascii=False)
+    return True, str(cur)
+
+
+def fill_payload(template, payload_ctx):
+    """Ersetzt {payload} durch die empfangene Nachricht und {payload.feld}
+    durch ein Feld aus einer JSON-Nachricht (fehlt das Feld: leerer Text)."""
+    def sub(match):
+        path = match.group(1)
+        if not path:
+            return payload_ctx
+        ok, value = extract_json_field(payload_ctx, path)
+        return value if ok else ""
+    return _PLACEHOLDER.sub(sub, str(template))
+
+
 TRUE_WORDS = ("1", "true", "on", "an", "ein", "ja", "yes", "wahr")
 
 
@@ -370,7 +423,7 @@ def evaluate_condition(node, payload_ctx, location, now=None, markers=None):
 # MQTT: einmaliges Veroeffentlichen (kurzlebige Verbindung pro Aufruf, damit
 # gleichzeitig laufende Ablaeufe sich nicht gegenseitig blockieren koennen)
 # --------------------------------------------------------------------------
-def evaluate_gate(node, payload_ctx, location, nodes_by_id, connections, markers, _stack=None):
+def evaluate_gate(node, payload_ctx, location, nodes_by_id, connections, markers, _stack=None, trace=None):
     """Wertet ein UND/ODER-Element aus. Gibt (ergebnis, details) zurueck;
     details ist eine Liste aus (Name, Ja/Nein) je verbundenem Eingang.
     Eingaenge sind Bedingungen oder weitere UND/ODER-Elemente, die ueber
@@ -391,9 +444,11 @@ def evaluate_gate(node, payload_ctx, location, nodes_by_id, connections, markers
             result = evaluate_condition(src, payload_ctx, location, markers=markers)
         elif src["type"] in ("and", "or"):
             name = src.get("label") or ("UND" if src["type"] == "and" else "ODER")
-            result, _sub = evaluate_gate(src, payload_ctx, location, nodes_by_id, connections, markers, stack)
+            result, _sub = evaluate_gate(src, payload_ctx, location, nodes_by_id, connections, markers, stack, trace)
         else:
             continue
+        if trace:
+            trace(c.get("id", ""), result)
         details.append((name, result))
     if not details:
         return False, []
@@ -478,6 +533,10 @@ class FlowEngine:
         self._marker_init = {}     # zuletzt gesehener Startwert je Merker
         self._mlock = threading.RLock()
         self._persisted = self._load_persisted_markers()
+        self._tl = threading.local()          # Lauf-ID je Ablauf-Thread
+        self._trace_lock = threading.RLock()
+        self._trace_events = []               # Ablauf-Protokoll fuer die Anzeige
+        self._trace_seq = 0
 
     def log_event(self, text: str) -> None:
         with self._events_lock:
@@ -581,6 +640,28 @@ class FlowEngine:
             except Exception:
                 pass
 
+    # ---- Ablauf-Anzeige -------------------------------------------------
+    def _trace(self, kind, **data):
+        """Haelt fest, was der Ablauf gerade tut (Kante durchlaufen, Block
+        betreten/verlassen ...) - die Weboberflaeche zeigt es als wandernden
+        Punkt und leuchtenden Block an."""
+        with self._trace_lock:
+            self._trace_seq += 1
+            event = {"seq": self._trace_seq, "t": round(time.time(), 3),
+                     "run": getattr(self._tl, "run", ""), "kind": kind}
+            event.update(data)
+            self._trace_events.append(event)
+            if len(self._trace_events) > 400:
+                del self._trace_events[:100]
+
+    def get_trace(self, since):
+        with self._trace_lock:
+            if since < 0:
+                return [], self._trace_seq
+            if since > self._trace_seq:      # Server wurde neu gestartet
+                since = 0
+            return [e for e in self._trace_events if e["seq"] > since], self._trace_seq
+
     # ---- Merker --------------------------------------------------------
     def _load_persisted_markers(self):
         try:
@@ -651,7 +732,17 @@ class FlowEngine:
         with self._mlock:
             current = self.markers.get(node["id"], str(node.get("marker_initial", "")))
             if action == "set":
-                new = str(node.get("marker_value", "")).replace("{payload}", payload_ctx)
+                new = fill_payload(node.get("marker_value", ""), payload_ctx)
+            elif action == "store":
+                # Empfangenen Wert (ganze Nachricht oder ein JSON-Feld) speichern
+                path = str(node.get("marker_value", "")).strip()
+                if path:
+                    found, value = extract_json_field(payload_ctx, path)
+                    if not found:
+                        raise ValueError(f"{value} (Nachricht: {payload_ctx[:60]!r})")
+                    new = value
+                else:
+                    new = payload_ctx
             elif action == "toggle":
                 new = "0" if is_truthy(current) else "1"
             elif action in ("inc", "dec"):
@@ -671,6 +762,7 @@ class FlowEngine:
         fixed = max(0.0, float(node.get("delay_sec", 1.0) or 0))
         if node.get("delay_source", "fixed") != "marker":
             return fixed
+        self._trace("ref", marker=node.get("delay_marker_id"), target=node["id"])
         with self._mlock:
             raw = self.markers.get(node.get("delay_marker_id"))
         factor = {"ms": 0.001, "s": 1.0, "min": 60.0, "h": 3600.0}.get(
@@ -684,6 +776,8 @@ class FlowEngine:
 
     # ---- Ablauf-Ausfuehrung -------------------------------------------
     def run_flow_from(self, start_node_id: str, payload_ctx: str, start_port: str) -> None:
+        self._tl.run = uuid.uuid4().hex[:6]
+        self._trace("start", node=start_node_id)
         cfg = load_config()
         nodes_by_id = {n["id"]: n for n in cfg["nodes"]}
         brokers_by_id = {b["id"]: b for b in cfg["brokers"]}
@@ -702,7 +796,10 @@ class FlowEngine:
             if guard in visited:
                 continue  # einfache Zyklen-Bremse
             visited.add(guard)
+            self._trace("edge", conn=edge.get("id", ""), frm=node_id, port=from_port, to=target["id"])
+            self._trace("enter", node=target["id"])
             next_port = self._execute(target, payload_ctx, brokers_by_id, nodes_by_id, connections)
+            self._trace("leave", node=target["id"], result=next_port or "stop")
             payload_ctx = self._last_payload if hasattr(self, "_last_payload") else payload_ctx
             if next_port:
                 self._walk(target["id"], next_port, payload_ctx, nodes_by_id, brokers_by_id, connections, visited)
@@ -719,7 +816,7 @@ class FlowEngine:
                 if not broker:
                     self.log_event(f"Fehler: Aktion '{node.get('label') or node['id']}' hat keinen gueltigen Broker.")
                     return None
-                text = (node.get("payload") or "").replace("{payload}", payload_ctx)
+                text = fill_payload(node.get("payload") or "", payload_ctx)
                 mqtt_publish_once(broker, node.get("topic", ""), text,
                                    qos=int(node.get("qos", 0) or 0), retain=bool(node.get("retain")))
                 self.log_event(f"Gesendet: {node.get('topic')} = {text!r}")
@@ -730,6 +827,8 @@ class FlowEngine:
                 return "out"
 
             if ntype == "condition":
+                if node.get("cond_type") == "marker" and node.get("marker_id"):
+                    self._trace("ref", marker=node["marker_id"], target=node["id"])
                 ok = evaluate_condition(node, payload_ctx, load_config().get("location") or {},
                                         markers=self.get_markers())
                 ctype = node.get("cond_type", "payload")
@@ -739,7 +838,8 @@ class FlowEngine:
 
             if ntype in ("and", "or"):
                 ok, details = evaluate_gate(node, payload_ctx, load_config().get("location") or {},
-                                            nodes_by_id or {}, connections or [], self.get_markers())
+                                            nodes_by_id or {}, connections or [], self.get_markers(),
+                                            trace=lambda cid, res: self._trace("data", conn=cid, result=res))
                 title = "UND" if ntype == "and" else "ODER"
                 name = node.get("label") or title
                 answer = "Ja" if ok else "Nein"
@@ -799,6 +899,7 @@ def api_save_config():
     data.setdefault("nodes", [])
     data.setdefault("connections", [])
     data.setdefault("location", DEFAULT_CONFIG["location"])
+    data.setdefault("pages", DEFAULT_CONFIG["pages"])
     save_config(data)
     ENGINE.rebuild(data)
     return jsonify({"status": "ok"})
@@ -835,6 +936,16 @@ def api_simulate(node_id):
     ENGINE.log_event(f"Simuliert: '{node.get('label') or node_id}'")
     threading.Thread(target=ENGINE.run_flow_from, args=(node_id, payload_ctx, "out"), daemon=True).start()
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/trace")
+def api_trace():
+    try:
+        since = int(request.args.get("since", "-1"))
+    except ValueError:
+        since = -1
+    events, last = ENGINE.get_trace(since)
+    return jsonify({"events": events, "last": last})
 
 
 @app.route("/api/markers", methods=["GET"])
@@ -920,9 +1031,29 @@ INDEX_HTML = r"""
   .dot-delay{ background:var(--text-dim); } .dot-cond{ background:var(--accent-3); }
   .dot-marker{ background:#4cc9f0; } .dot-gate{ background:#f4d35e; }
 
-  .canvas-wrap{ flex:1; position:relative; overflow:auto; background:
-    radial-gradient(circle, #1c212a 1px, transparent 1px) 0 0/22px 22px, var(--bg); }
-  .canvas{ position:relative; width:2400px; height:1500px; }
+  .center{ flex:1; min-width:0; display:flex; flex-direction:column; }
+  .tabs{ display:flex; align-items:flex-end; gap:2px; padding:6px 10px 0; background:var(--panel);
+         border-bottom:1px solid var(--border); overflow-x:auto; flex-shrink:0; }
+  .tab{ display:flex; align-items:center; gap:7px; padding:6px 12px; font-size:12px; color:var(--text-dim);
+        border:1px solid transparent; border-bottom:none; border-radius:7px 7px 0 0; cursor:pointer;
+        white-space:nowrap; user-select:none; }
+  .tab:hover{ color:var(--text); }
+  .tab.active{ background:var(--bg); color:var(--text); border-color:var(--border); }
+  .tab-x{ color:var(--text-dim); font-size:14px; line-height:1; } .tab-x:hover{ color:var(--danger); }
+  .tab-add{ font-weight:700; font-size:14px; } .tab-spacer{ flex:1; }
+  .tab-move{ color:var(--accent-2); }
+  .tab.run{ color:var(--accent); animation:tabflash .9s; }
+  @keyframes tabflash{ 0%,100%{ background:transparent; } 50%{ background:#ff914233; } }
+  .canvas-wrap{ flex:1; min-height:0; position:relative; overflow:auto; background:var(--bg); }
+  .canvas{ position:relative; width:6000px; height:4000px;
+           background:radial-gradient(circle, #1c212a 1px, transparent 1px) 0 0/22px 22px; }
+  .flow-node{ transition:box-shadow .15s; }
+  .flow-node.running{ box-shadow:0 0 0 2px #ff9142, 0 0 18px #ff914299; }
+  .flow-node.pulse, .flow-node.res-true{ box-shadow:0 0 0 2px #3ddc97, 0 0 16px #3ddc9799; }
+  .flow-node.res-false{ box-shadow:0 0 0 2px #ff5d5d, 0 0 16px #ff5d5d99; }
+  .flow-node.res-out{ box-shadow:0 0 0 2px #3ddc97aa; }
+  .flow-node.res-stop{ box-shadow:0 0 0 2px #8891a0; }
+  .marker-val{ color:#4cc9f0; font-size:12px; }
   svg.conn-layer{ position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
   svg.conn-layer path{ pointer-events:stroke; cursor:pointer; }
 
@@ -1036,13 +1167,17 @@ INDEX_HTML = r"""
       Bearbeiten: auf den Blockinhalt klicken.<br>
       Merker: speichert einen Wert; Bedingungen und Wartezeiten koennen ihn verwenden. Die Verbindung zeigt eine gestrichelte Linie automatisch.<br>
       UND/ODER: den Ergebnis-Ausgang (&#9670; unten) von Bedingungen auf den Eingang (&#9670; oben) ziehen; der Ablauf geht dann ueber Ja/Nein weiter.<br>
+      Seiten: oben mit + eine neue Seite anlegen, Doppelklick auf den Reiter benennt um. Merker gelten auf allen Seiten.<br>
       Loeschen: Block/Linie anklicken, dann &times; bzw. Entf.
     </div>
   </div>
 
-  <div class="canvas-wrap" id="canvasWrap">
-    <div class="canvas" id="canvas">
-      <svg class="conn-layer" id="connLayer"></svg>
+  <div class="center">
+    <div class="tabs" id="pageTabs"></div>
+    <div class="canvas-wrap" id="canvasWrap">
+      <div class="canvas" id="canvas">
+        <svg class="conn-layer" id="connLayer"></svg>
+      </div>
     </div>
   </div>
 
@@ -1208,11 +1343,17 @@ INDEX_HTML = r"""
     <div id="fields_or"><div class="hint" style="margin-top:0;">ODER: Der Ablauf geht über „Ja“ weiter, wenn <b>mindestens ein</b> verbundener Eingang Ja ergibt, sonst über „Nein“. Verbinden: Ergebnis-Ausgang (&#9670; unten) einer Bedingung auf den Eingang (&#9670; oben) dieses Elements ziehen.</div></div>
     <div id="fields_marker">
       <div class="hint" style="margin-top:0;">Ein Merker speichert einen Wert. Läuft ein Ablauf in diesen Block, wird die Aktion ausgeführt. Bedingungen und Wartezeiten können den Wert verwenden. Die Bezeichnung oben ist der Name des Merkers.</div>
-      <label>Startwert</label>
+      <label>Aktueller Wert (live)</label>
+      <div class="row">
+        <div><input id="m_current" oninput="mCurrentDirty = true" placeholder="-"></div>
+        <div style="flex:0 0 auto;"><button class="btn-mini" style="margin-top:2px;" onclick="setMarkerNow()">Jetzt setzen</button></div>
+      </div>
+      <label>Startwert (leer = noch kein Wert)</label>
       <input id="m_initial" placeholder="z. B. 0">
       <label>Aktion, wenn der Ablauf den Block erreicht</label>
-      <select id="m_action" onchange="onMarkerActionChange()">
+      <select id="m_action" onchange="onMarkerActionChange(true)">
         <option value="set">Wert setzen</option>
+        <option value="store">Empfangenen Wert speichern (Nachricht / JSON-Feld)</option>
         <option value="toggle">Umschalten (0 / 1)</option>
         <option value="inc">Erhöhen (zählen)</option>
         <option value="dec">Verringern</option>
@@ -1257,6 +1398,16 @@ INDEX_HTML = r"""
   </div>
 </div>
 
+<!-- Auswahl verschieben -->
+<div class="modal-backdrop" id="moveModal">
+  <div class="modal">
+    <h2>Markierte Elemente verschieben nach</h2>
+    <div id="moveList"></div>
+    <div class="hint">Linien zu Elementen, die auf der alten Seite bleiben, werden entfernt. Merker gelten seitenübergreifend.</div>
+    <div class="actions"><button class="btn-ghost" onclick="closeMoveModal()">Abbrechen</button></div>
+  </div>
+</div>
+
 <!-- Standort-Modal -->
 <div class="modal-backdrop" id="locationModal">
   <div class="modal">
@@ -1275,10 +1426,13 @@ INDEX_HTML = r"""
 </div>
 
 <script>
-let STATE = { brokers: [], nodes: [], connections: [], location: { lat: 51.1657, lon: 10.4515 } };
+let STATE = { brokers: [], nodes: [], connections: [], location: { lat: 51.1657, lon: 10.4515 },
+              pages: [{ id: 'page_1', name: 'Seite 1' }] };
 let selectedIds = new Set(), selectedConnId = null, editingNodeId = null;
 let dragGroup = null, marquee = null;
 let MARKER_VALUES = {};
+let currentPage = 'page_1';
+const pageScroll = {};
 let dragNode = null, dragOffset = {x:0,y:0};
 let drawingConn = null; // {fromId, fromPort, x1, y1}
 let saveTimer = null;
@@ -1317,9 +1471,14 @@ async function loadConfig(){
   const res = await fetch('/api/config');
   const data = await res.json();
   STATE.brokers = data.brokers; STATE.nodes = data.nodes; STATE.connections = data.connections;
+  if (data.pages && data.pages.length) STATE.pages = data.pages;
+  let savedPage = null;
+  try { savedPage = localStorage.getItem('ablaufPage'); } catch(e) {}
+  currentPage = STATE.pages.some(p => p.id === savedPage) ? savedPage : STATE.pages[0].id;
   if (data.location) STATE.location = data.location;
   MARKER_VALUES = data._markers || {};
   renderAll();
+  renderPageTabs();
   renderLog(data._events || []);
 }
 
@@ -1333,7 +1492,7 @@ async function saveConfig(showToast){
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ server: {host:'0.0.0.0', port:8020}, brokers: STATE.brokers,
                            nodes: STATE.nodes, connections: STATE.connections,
-                           location: STATE.location })
+                           location: STATE.location, pages: STATE.pages })
   });
   if (showToast){
     if (res.ok) toast('Gespeichert.'); else toast('Fehler beim Speichern.', false);
@@ -1342,9 +1501,10 @@ async function saveConfig(showToast){
 
 // ---------------- Bloecke ----------------
 function addNode(type){
-  const count = STATE.nodes.length;
+  const count = STATE.nodes.filter(n => n.page === currentPage).length;
   const node = {
     id: 'node_' + Math.random().toString(16).slice(2,10),
+    page: currentPage,
     type, x: 60 + (count % 6) * 40, y: 60 + Math.floor(count/6) * 120,
     label:'', broker_id:'', topic:'', payload:'', qos:0, retain:false,
     delay_sec:1.0, operator:'eq', compare_value:'',
@@ -1363,6 +1523,7 @@ function addNode(type){
 function nodeById(id){ return STATE.nodes.find(n => n.id === id); }
 
 function renderAll(){
+  updateCanvasSize();
   renderNodes();
   renderConnections();
 }
@@ -1384,7 +1545,7 @@ function opLabel(op){
 function renderNodes(){
   const canvas = document.getElementById('canvas');
   canvas.querySelectorAll('.flow-node').forEach(el => el.remove());
-  STATE.nodes.forEach(n => {
+  STATE.nodes.filter(n => n.page === currentPage).forEach(n => {
     const meta = NODE_META[n.type];
     const div = document.createElement('div');
     div.className = 'flow-node type-' + n.type + (selectedIds.has(n.id) ? ' selected' : '');
@@ -1517,19 +1678,20 @@ function renderConnections(){
     const p2 = { x: b.x + b.w * 0.25, y: down ? b.y : b.y + b.h };
     const path = svgEl('path', { d: pathVertical(p1, p2, down ? 1 : -1), fill:'none', stroke:'#4cc9f0aa',
       'stroke-width':'1.6', 'stroke-dasharray':'6,4', 'marker-end':'url(#arrowData)',
-      'data-ref': r.marker + '>' + r.target });
+      'data-ref': r.marker + '>' + r.target, 'data-key': 'r:' + r.marker + '|' + r.target });
     path.style.pointerEvents = 'none';
     svg.appendChild(path);
   });
 
   // 2) Ablauflinien (durchgezogen) und Datenlinien zu UND/ODER (gestrichelt)
   STATE.connections.forEach(c => {
+    if (!nodeBox(c.from) || !nodeBox(c.to)) return;   // Element liegt auf einer anderen Seite
     const isData = c.to_port === 'data';
     const p1 = nodePortPos(c.from, c.from_port || 'out');
     const p2 = nodePortPos(c.to, isData ? 'data' : 'in');
     const sel = c.id === selectedConnId;
     const path = svgEl('path', { d: isData ? pathVertical(p1, p2, 1) : pathBetween(p1, p2), fill:'none',
-      stroke: sel ? '#ff9142' : (isData ? '#4cc9f0cc' : '#3ddc9799'), 'stroke-width': sel ? '2.5' : '2' });
+      stroke: sel ? '#ff9142' : (isData ? '#4cc9f0cc' : '#3ddc9799'), 'stroke-width': sel ? '2.5' : '2', 'data-key': 'c:' + c.id });
     if (isData){ path.setAttribute('stroke-dasharray', '6,4'); path.setAttribute('marker-end', 'url(#arrowData)'); }
     path.style.pointerEvents = 'stroke';
     path.onclick = () => { selectedConnId = c.id; selectedIds.clear(); renderAll(); };
@@ -1608,6 +1770,7 @@ function endMarquee(){ marquee.el.remove(); marquee = null; }
 
 document.addEventListener('mousemove', (e) => {
   const wrap = document.getElementById('canvasWrap');
+  if (dragGroup || marquee) autoScroll(e, wrap);
   if (dragGroup){
     let dx = e.clientX + wrap.scrollLeft - dragGroup.sx;
     let dy = e.clientY + wrap.scrollTop - dragGroup.sy;
@@ -1621,6 +1784,7 @@ document.addEventListener('mousemove', (e) => {
       if (el){ el.style.left = n.x + 'px'; el.style.top = n.y + 'px'; }
     });
     if (dx !== 0 || dy !== 0) dragGroup.moved = true;
+    updateCanvasSize();
     renderConnections();
   }
   if (marquee) updateMarquee(e);
@@ -1640,7 +1804,7 @@ document.addEventListener('keydown', (e) => {
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
   if (document.querySelector('.modal-backdrop.show')) return;
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a'){
-    e.preventDefault(); setSelection(STATE.nodes.map(n => n.id));
+    e.preventDefault(); setSelection(STATE.nodes.filter(n => n.page === currentPage).map(n => n.id));
   } else if (e.key === 'Escape'){
     setSelection([]); selectedConnId = null; renderConnections();
   }
@@ -1854,7 +2018,7 @@ function condSummary(n){
   const OPS = {eq:'=', neq:'&ne;', contains:'enthält', gt:'&gt;', gte:'&ge;', lt:'&lt;', lte:'&le;'};
   if (t === 'marker'){
     const m = nodeById(n.marker_id);
-    const nm = escapeHtml(m ? (m.label || 'Merker') : '(gelöscht)');
+    const nm = escapeHtml(m ? markerLabelFor(m, n) : '(gelöscht)');
     if (n.marker_op === 'true') return `Merker <b>${nm}</b> ist wahr`;
     if (n.marker_op === 'false') return `Merker <b>${nm}</b> ist falsch`;
     return `Merker <b>${nm}</b> ${OPS[n.marker_op] || '='} <b>${escapeHtml(n.marker_cmp || '-')}</b>`;
@@ -1974,13 +2138,14 @@ function nextMarkerName(){
 function fillMarkerSelect(sel, selectedId){
   const ms = STATE.nodes.filter(n => n.type === 'marker');
   sel.innerHTML = ms.length
-    ? ms.map(m => `<option value="${m.id}" ${m.id === selectedId ? 'selected' : ''}>${escapeHtml(m.label || 'Merker')}</option>`).join('')
+    ? ms.map(m => `<option value="${m.id}" ${m.id === selectedId ? 'selected' : ''}>${escapeHtml(markerLabel(m))}</option>`).join('')
     : `<option value="">-- zuerst einen Merker-Block platzieren --</option>`;
 }
 function markerActionText(n){
   const v = escapeHtml(n.marker_value ?? '');
   return ({ set: `setzen auf ${v}`, toggle: 'umschalten', inc: `+ ${v || 1}`, dec: `- ${v || 1}`,
-            reset: 'auf Startwert' })[n.marker_action || 'set'] || '';
+            reset: 'auf Startwert',
+            store: v ? `speichern (Feld ${v})` : 'Nachricht speichern' })[n.marker_action || 'set'] || '';
 }
 function markerSummary(n){
   const cur = MARKER_VALUES[n.id];
@@ -1990,7 +2155,7 @@ function delaySummary(n){
   if (n.delay_source === 'marker'){
     const m = nodeById(n.delay_marker_id);
     const unit = ({ ms:'ms', s:'s', min:'min', h:'h' })[n.delay_marker_unit] || 's';
-    return `Dauer: Merker <b>${escapeHtml(m ? (m.label || 'Merker') : '(gelöscht)')}</b> [${unit}]`;
+    return `Dauer: Merker <b>${escapeHtml(m ? markerLabelFor(m, n) : '(gelöscht)')}</b> [${unit}]`;
   }
   return `Dauer: <b>${escapeHtml(n.delay_sec)} s</b>`;
 }
@@ -1999,6 +2164,13 @@ function updateMarkerValues(){
     const v = MARKER_VALUES[el.dataset.id];
     if (v !== undefined) el.textContent = v;
   });
+  // Ist der Merker-Dialog offen, den Live-Wert nachfuehren (solange nicht von Hand geaendert)
+  const mc = document.getElementById('m_current');
+  if (mc && editingNodeId && !mCurrentDirty && document.activeElement !== mc
+      && document.getElementById('nodeModal').classList.contains('show')){
+    const n = nodeById(editingNodeId);
+    if (n && n.type === 'marker' && MARKER_VALUES[n.id] !== undefined) mc.value = MARKER_VALUES[n.id];
+  }
 }
 function warnMarkerUsed(ids){
   const used = ids.filter(id => {
@@ -2019,18 +2191,45 @@ async function editMarkerValue(id, e){
   if (res.ok){ MARKER_VALUES[id] = v; updateMarkerValues(); toast('Merker gesetzt.'); }
   else toast('Merker noch nicht gespeichert - bitte kurz warten und erneut versuchen.', false);
 }
-function onMarkerActionChange(){
+let mCurrentDirty = false;
+function onMarkerActionChange(userChanged){
   const a = document.getElementById('m_action').value;
+  const valueEl = document.getElementById('m_value');
   document.getElementById('m_value_wrap').style.display = (a === 'toggle' || a === 'reset') ? 'none' : 'block';
-  document.getElementById('m_value_lbl').textContent =
-    a === 'set' ? 'Wert ({payload} = zuletzt empfangene Nachricht)' : 'Schrittweite';
+  document.getElementById('m_value_lbl').textContent = ({
+    set: 'Wert ({payload} = empfangene Nachricht, {payload.feld} = JSON-Feld)',
+    store: 'JSON-Feld (leer = ganze Nachricht, z. B. temperature oder sensor.temp)'
+  })[a] || 'Schrittweite';
+  valueEl.placeholder = a === 'store' ? 'z. B. temperature' : 'z. B. 1';
+  if (userChanged === true){
+    if (a === 'store' && valueEl.value === '1') valueEl.value = '';
+    else if (a !== 'store' && valueEl.value === '') valueEl.value = '1';
+  }
 }
 function loadMarkerFields(n){
   document.getElementById('m_initial').value = n.marker_initial ?? '0';
   document.getElementById('m_action').value = n.marker_action || 'set';
   document.getElementById('m_value').value = n.marker_value ?? '1';
   document.getElementById('m_retain').checked = !!n.marker_retain;
+  mCurrentDirty = false;
+  document.getElementById('m_current').value = MARKER_VALUES[n.id] ?? '';
   onMarkerActionChange();
+  fetch('/api/markers').then(r => r.json()).then(d => {      // aktuellen Wert frisch vom Server holen
+    MARKER_VALUES = d.markers || MARKER_VALUES;
+    if (!mCurrentDirty && editingNodeId === n.id && MARKER_VALUES[n.id] !== undefined)
+      document.getElementById('m_current').value = MARKER_VALUES[n.id];
+    updateMarkerValues();
+  }).catch(() => {});
+}
+async function setMarkerNow(){
+  const n = nodeById(editingNodeId);
+  if (!n) return;
+  const v = document.getElementById('m_current').value;
+  await saveConfig(false);   // der Merker muss dem Server bekannt sein
+  const res = await fetch(`/api/markers/${n.id}`, { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ value: v }) });
+  if (res.ok){ MARKER_VALUES[n.id] = v; mCurrentDirty = false; updateMarkerValues(); toast('Merker gesetzt.'); }
+  else toast('Merker konnte nicht gesetzt werden.', false);
 }
 function readMarkerFields(n, errEl, prevLabel){
   const fail = (msg) => { n.label = prevLabel; errEl.textContent = msg; errEl.style.display = 'block'; return false; };
@@ -2075,6 +2274,214 @@ function readDelayFields(n, errEl){
   }
   n.delay_sec = fixed; n.delay_source = src;
   return true;
+}
+
+// ---------------- Seiten ----------------
+function pageName(id){ const p = STATE.pages.find(x => x.id === id); return p ? p.name : '?'; }
+function markerLabel(m){ return (m.label || 'Merker') + (STATE.pages.length > 1 ? ` [${pageName(m.page)}]` : ''); }
+function markerLabelFor(m, ref){
+  return (m.label || 'Merker') + ((STATE.pages.length > 1 && m.page !== ref.page) ? ` [${pageName(m.page)}]` : '');
+}
+function renderPageTabs(){
+  const el = document.getElementById('pageTabs');
+  el.innerHTML = STATE.pages.map(p =>
+      `<div class="tab ${p.id === currentPage ? 'active' : ''}" data-page="${escapeHtml(p.id)}" title="Doppelklick: umbenennen">`
+      + `<span>${escapeHtml(p.name)}</span>`
+      + (STATE.pages.length > 1 ? `<span class="tab-x" title="Seite löschen">&times;</span>` : '') + `</div>`).join('')
+    + `<div class="tab tab-add" title="Neue Seite">+</div><div class="tab-spacer"></div>`
+    + `<div class="tab tab-move" title="Markierte Elemente auf eine andere Seite verschieben">Auswahl verschieben &rarr;</div>`;
+}
+document.getElementById('pageTabs').addEventListener('click', (e) => {
+  const tab = e.target.closest('.tab');
+  if (!tab) return;
+  if (e.target.closest('.tab-x')){ deletePage(tab.dataset.page); return; }
+  if (tab.classList.contains('tab-add')) addPage();
+  else if (tab.classList.contains('tab-move')) openMoveModal();
+  else switchPage(tab.dataset.page);
+});
+document.getElementById('pageTabs').addEventListener('dblclick', (e) => {
+  const tab = e.target.closest('.tab');
+  if (tab && tab.dataset.page) renamePage(tab.dataset.page);
+});
+function switchPage(id){
+  if (id === currentPage || !STATE.pages.some(p => p.id === id)) return;
+  const wrap = document.getElementById('canvasWrap');
+  pageScroll[currentPage] = { x: wrap.scrollLeft, y: wrap.scrollTop };
+  currentPage = id;
+  try { localStorage.setItem('ablaufPage', id); } catch(e) {}
+  selectedIds.clear(); selectedConnId = null;
+  renderAll(); renderPageTabs();
+  const sc = pageScroll[id] || { x: 0, y: 0 };
+  wrap.scrollLeft = sc.x; wrap.scrollTop = sc.y;
+}
+function uniquePageName(base){
+  let name = base, i = 2;
+  while (STATE.pages.some(p => p.name.toLowerCase() === name.toLowerCase())) name = base + ' ' + (i++);
+  return name;
+}
+function addPage(){
+  const page = { id: 'page_' + Math.random().toString(16).slice(2,10), name: uniquePageName('Seite ' + (STATE.pages.length + 1)) };
+  STATE.pages.push(page);
+  scheduleSave();
+  switchPage(page.id);
+  renderPageTabs();
+  return page;
+}
+function renamePage(id){
+  const p = STATE.pages.find(x => x.id === id);
+  if (!p) return;
+  const name = prompt('Name der Seite:', p.name);
+  if (name === null) return;
+  const clean = name.trim();
+  if (!clean) { toast('Der Name darf nicht leer sein.', false); return; }
+  if (STATE.pages.some(x => x.id !== id && x.name.toLowerCase() === clean.toLowerCase())){
+    toast('Eine Seite mit diesem Namen gibt es schon.', false); return;
+  }
+  p.name = clean; renderPageTabs(); renderAll(); scheduleSave();
+}
+function deletePage(id){
+  if (STATE.pages.length < 2){ toast('Die letzte Seite kann nicht gelöscht werden.', false); return; }
+  const p = STATE.pages.find(x => x.id === id);
+  if (!p) return;
+  const ids = STATE.nodes.filter(n => n.page === id).map(n => n.id);
+  if (!confirm(`Seite "${p.name}" mit ${ids.length} Element(en) wirklich löschen?`)) return;
+  warnMarkerUsed(ids);
+  const gone = new Set(ids);
+  STATE.nodes = STATE.nodes.filter(n => !gone.has(n.id));
+  STATE.connections = STATE.connections.filter(c => !gone.has(c.from) && !gone.has(c.to));
+  STATE.pages = STATE.pages.filter(x => x.id !== id);
+  if (currentPage === id){
+    currentPage = STATE.pages[0].id;
+    try { localStorage.setItem('ablaufPage', currentPage); } catch(e) {}
+  }
+  selectedIds.clear(); selectedConnId = null;
+  renderAll(); renderPageTabs(); scheduleSave();
+}
+function openMoveModal(){
+  if (!selectedIds.size){ toast('Zuerst Elemente markieren (Rahmen aufziehen).', false); return; }
+  document.getElementById('moveList').innerHTML =
+    STATE.pages.filter(p => p.id !== currentPage)
+      .map(p => `<div class="pal-item" data-page="${escapeHtml(p.id)}">${escapeHtml(p.name)}</div>`).join('')
+    + `<div class="pal-item" data-page="__new__">+ Neue Seite</div>`;
+  document.getElementById('moveModal').classList.add('show');
+}
+function closeMoveModal(){ document.getElementById('moveModal').classList.remove('show'); }
+document.getElementById('moveList').addEventListener('click', (e) => {
+  const item = e.target.closest('.pal-item');
+  if (item) moveSelection(item.dataset.page);
+});
+function moveSelection(pageId){
+  const ids = new Set(selectedIds);
+  if (!ids.size) return;
+  if (pageId === '__new__'){
+    const page = { id: 'page_' + Math.random().toString(16).slice(2,10), name: uniquePageName('Seite ' + (STATE.pages.length + 1)) };
+    STATE.pages.push(page); pageId = page.id;
+  }
+  STATE.nodes.forEach(n => { if (ids.has(n.id)) n.page = pageId; });
+  const before = STATE.connections.length;
+  STATE.connections = STATE.connections.filter(c => {
+    const a = nodeById(c.from), b = nodeById(c.to);
+    return a && b && a.page === b.page;
+  });
+  const removed = before - STATE.connections.length;
+  selectedIds.clear(); closeMoveModal();
+  renderAll(); renderPageTabs(); scheduleSave();
+  toast(`${ids.size} Element(e) nach "${pageName(pageId)}" verschoben` + (removed ? `, ${removed} Linie(n) getrennt.` : '.'));
+}
+
+// ---------------- Arbeitsfläche ----------------
+function updateCanvasSize(){
+  const canvas = document.getElementById('canvas');
+  let maxX = 0, maxY = 0;
+  STATE.nodes.filter(n => n.page === currentPage).forEach(n => {
+    maxX = Math.max(maxX, n.x + 260); maxY = Math.max(maxY, n.y + 200);
+  });
+  canvas.style.width = Math.max(6000, maxX + 1200) + 'px';     // wächst mit den Elementen
+  canvas.style.height = Math.max(4000, maxY + 900) + 'px';
+}
+function autoScroll(e, wrap){
+  const r = wrap.getBoundingClientRect(), edge = 40, step = 24;
+  if (e.clientX > r.right - edge) wrap.scrollLeft += step; else if (e.clientX < r.left + edge) wrap.scrollLeft -= step;
+  if (e.clientY > r.bottom - edge) wrap.scrollTop += step; else if (e.clientY < r.top + edge) wrap.scrollTop -= step;
+}
+
+// ---------------- Ablauf-Anzeige (wandernder Punkt) ----------------
+let traceSince = -1;
+const traceRuns = new Map();
+const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
+function nodeEl(id){ return document.querySelector(`.flow-node[data-id="${id}"]`); }
+function nodeTitle(id){ const n = nodeById(id); return n ? (n.label || NODE_META[n.type].title) : ''; }
+function touchTab(nodeId){
+  const n = nodeById(nodeId);
+  if (!n || n.page === currentPage) return;
+  const t = document.querySelector(`.tab[data-page="${n.page}"]`);
+  if (t){ t.classList.add('run'); setTimeout(() => t.classList.remove('run'), 1000); }
+}
+function travel(key, color, label, ms){
+  return new Promise(resolve => {
+    const svg = document.getElementById('connLayer');
+    const path = svg.querySelector(`path[data-key="${key}"]`);
+    if (!path || typeof path.getTotalLength !== 'function'){ resolve(); return; }
+    const len = path.getTotalLength();
+    const dot = svgEl('circle', { r:'6', fill: color, stroke:'#0a0c0f', 'stroke-width':'1.5', class:'trace-dot' });
+    svg.appendChild(dot);
+    let text = null;
+    if (label){
+      text = svgEl('text', { fill:'#e5e8ec', 'font-size':'10', 'font-family':'monospace', class:'trace-label' });
+      text.textContent = label; svg.appendChild(text);
+    }
+    const t0 = performance.now();
+    function step(now){
+      const k = Math.min(1, (now - t0) / ms);
+      const pt = path.getPointAtLength(len * k);
+      dot.setAttribute('cx', pt.x); dot.setAttribute('cy', pt.y);
+      if (text){ text.setAttribute('x', pt.x + 9); text.setAttribute('y', pt.y - 8); }
+      if (k < 1) requestAnimationFrame(step);
+      else { dot.remove(); if (text) text.remove(); resolve(); }
+    }
+    requestAnimationFrame(step);
+  });
+}
+async function playTrace(ev){
+  if (ev.kind === 'start'){
+    touchTab(ev.node);
+    const el = nodeEl(ev.node);
+    if (el){ el.classList.add('pulse'); await sleepMs(450); el.classList.remove('pulse'); }
+  } else if (ev.kind === 'edge'){
+    touchTab(ev.to);
+    await travel('c:' + ev.conn, '#ff9142', nodeTitle(ev.to), 650);
+  } else if (ev.kind === 'data'){
+    await travel('c:' + ev.conn, ev.result ? '#3ddc97' : '#ff5d5d', ev.result ? 'Ja' : 'Nein', 450);
+  } else if (ev.kind === 'ref'){
+    await travel('r:' + ev.marker + '|' + ev.target, '#4cc9f0', 'Wert', 450);
+  } else if (ev.kind === 'enter'){
+    const el = nodeEl(ev.node);
+    if (el) el.classList.add('running');
+    await sleepMs(250);
+  } else if (ev.kind === 'leave'){
+    const el = nodeEl(ev.node);
+    if (el){
+      el.classList.remove('running');
+      const cls = 'res-' + (ev.result || 'out');
+      el.classList.add(cls); setTimeout(() => el.classList.remove(cls), 900);
+    }
+    await sleepMs(250);
+  }
+}
+function enqueueTrace(ev){
+  const key = ev.run || 'x';
+  traceRuns.set(key, (traceRuns.get(key) || Promise.resolve()).then(() => playTrace(ev)).catch(() => {}));
+  if (traceRuns.size > 100) traceRuns.delete(traceRuns.keys().next().value);
+}
+async function pollTrace(){
+  try{
+    if (document.hidden){ traceSince = -1; return; }   // im Hintergrund nichts anstauen
+    const res = await fetch('/api/trace?since=' + traceSince);
+    const data = await res.json();
+    if (traceSince < 0){ traceSince = data.last; return; }
+    (data.events || []).forEach(ev => { traceSince = Math.max(traceSince, ev.seq); enqueueTrace(ev); });
+    if (data.last < traceSince) traceSince = data.last;   // Server wurde neu gestartet
+  } catch(e){}
 }
 
 // ---------------- Broker-Modal ----------------
@@ -2123,6 +2530,8 @@ function deleteBroker(id){
 loadVersion();
 loadConfig();
 setInterval(pollLog, 2000);
+pollTrace();
+setInterval(pollTrace, 350);
 </script>
 </body>
 </html>
