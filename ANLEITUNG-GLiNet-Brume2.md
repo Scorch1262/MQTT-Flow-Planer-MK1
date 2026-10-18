@@ -37,13 +37,15 @@ df -h /overlay
 opkg update
 opkg install python3 python3-pip python3-light python3-openssl ca-certificates
 python3 -m pip install --upgrade pip
-python3 -m pip install flask paho-mqtt
+python3 -m pip install flask paho-mqtt certifi
 ```
 
 Hinweis: Je nach Firmware-Version koennen sich Paketnamen leicht
 unterscheiden. Falls ein `opkg install`-Befehl "not found" meldet, mit
 `opkg list | grep python3-` nachsehen, welche Pakete tatsaechlich zur
 Verfuegung stehen.
+
+Fuer die Wetter-Funktion (ab v1.7.0) braucht das Programm Internet, die Python-Bibliothek `urllib` (meldet das Programm einen Importfehler: `opkg install python3-urllib`) und gueltige Zertifikate (`ca-certificates`, oben bereits installiert). Der Router-Standort wird im Programm unter "Standort & Wetter" eingestellt.
 
 Ab v1.3.0 funktioniert das Programm sowohl mit paho-mqtt 2.x als auch
 mit der aelteren 1.x-Version aus den opkg-Paketen vieler Router. Die

@@ -7,7 +7,7 @@ Blockschaltbild zu entwerfen - Bloecke werden per Klick auf die
 Zeichenflaeche gelegt, per Drag & Drop positioniert und durch Linien zu
 einem Ablauf verschaltet (aehnlich Node-RED).
 
-**Aktuelle Version: v1.6.0**
+**Aktuelle Version: v1.7.0**
 
 ## Bloecke
 
@@ -51,6 +51,11 @@ Bedienung:
 **Flaeche:** Die Arbeitsflaeche ist 6000 x 4000 Pixel gross und waechst automatisch mit, wenn Elemente weiter aussen liegen. Beim Ziehen am Rand scrollt sie mit.
 
 **Ablaufanzeige:** Laeuft ein Ablauf, wandert ein kleiner Punkt (mit dem Namen des Ziel-Blocks) ueber die Linie; der gerade aktive Block leuchtet orange (bei einer Wartezeit, solange sie laeuft) und zeigt danach kurz sein Ergebnis (gruen = weiter/Ja, rot = Nein, grau = Zweig beendet). Bei UND/ODER laufen die Eingaenge als gruene (Ja) bzw. rote (Nein) Punkte ueber die Datenlinien, Merker-Zugriffe als blaue Punkte ueber die Merker-Linien. Ein Ablauf auf einer anderen Seite laesst deren Reiter aufblinken. Die Anzeige laeuft bewusst etwas langsamer als der echte Ablauf, damit man ihr folgen kann.
+
+**Wetter (Internet):** Das aktuelle Wetter am eingestellten Standort kommt von [Open-Meteo](https://open-meteo.com) (kein Schluessel noetig, nur fuer nicht-kommerzielle Nutzung). Es gibt zwei Einsatzarten:
+- **Bedingung** vom Typ *Wetter (Internet)*: z. B. `Temperatur > 25` oder `Wetterlage ist Regen` - danach geht es ueber "Ja"/"Nein" weiter (Rolladen runter, wenn es heisser als 25 Grad ist).
+- **Ausloeser** "Wetter (Ausloeser)": startet einen Ablauf von selbst. Modus *Beim Zutreffen* (nur beim Wechsel von "nein" auf "ja"), *Bei jeder Aenderung* oder *Solange zutreffend* (bei jeder Abfrage); optional schon beim Programmstart. Beispiel: es regnet -> Licht an.
+Messwerte: Temperatur, gefuehlte Temperatur, Luftfeuchte, Wind, Windboeen, Niederschlag, Bewoelkung sowie Wetterlagen (Regen, Schnee, Gewitter, Nebel, klar, bewoelkt). Abfrageintervall 5-120 Minuten (Standard 10) im Dialog "Standort & Wetter"; der Knopf "Wetter" zeigt die aktuellen Werte. Bei Internetausfall werden die letzten Werte bis zu einer Stunde weiterverwendet, danach ergibt die Bedingung "Nein" und das Ereignisprotokoll nennt den Fehler. Hinweis: Es gibt keine Hysterese - schwankt ein Wert um die Schwelle, kann ein Ausloeser mehrfach feuern.
 
 Fuer die Sonnen-Bedingung den **Standort** (Knopf oben rechts) einstellen - Auf-/Untergang werden lokal berechnet (keine Internetverbindung noetig). Uhrzeit, Wochentag, Datum und Sonne verwenden die **Zeitzone des Rechners/Routers**.
 

@@ -51,7 +51,7 @@ Erreichbar unter:      http://<IP-DES-PCS>:8020  (im gesamten LAN)
 #   PATCH (x.x.+1) -> Bugfix, keine neuen Funktionen
 #   MINOR (x.+1.0) -> neue Funktion, abwaertskompatibel
 #   MAJOR (+1.0.0) -> Breaking Change (z. B. Config-Format aendert sich)
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 import os
 import sys
@@ -66,6 +66,15 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, request, jsonify, Response
+
+try:
+    import urllib.request as urlrequest
+except ImportError:  # pragma: no cover - manche OpenWrt-Installationen: opkg install python3-urllib
+    urlrequest = None
+try:
+    import certifi  # aktuelle CA-Zertifikate (v. a. fuer die macOS-App noetig)
+except ImportError:  # pragma: no cover
+    certifi = None
 
 try:
     import paho.mqtt.client as mqtt
@@ -104,6 +113,7 @@ DEFAULT_CONFIG = {
     "server": {"host": "0.0.0.0", "port": 8020},
     "location": {"lat": 51.1657, "lon": 10.4515},
     "pages": [{"id": "page_1", "name": "Seite 1"}],
+    "weather": {"interval_min": 10},
     "brokers": [],
     "nodes": [],
     "connections": []
@@ -131,6 +141,9 @@ def load_config() -> dict:
     for c in cfg["connections"]:
         c.setdefault("from_port", "out")
         c.setdefault("to_port", "in")   # "data" = Datenlinie zu einem UND/ODER-Element
+    if not isinstance(cfg.get("weather"), dict):
+        cfg["weather"] = {"interval_min": 10}
+    cfg["weather"].setdefault("interval_min", 10)
     # Seiten: jedes Element gehoert zu genau einer Seite (aeltere Dateien: Seite 1)
     if not isinstance(cfg.get("pages"), list) or not cfg["pages"]:
         cfg["pages"] = [{"id": "page_1", "name": "Seite 1"}]
@@ -181,6 +194,12 @@ def load_config() -> dict:
         n.setdefault("delay_source", "fixed")
         n.setdefault("delay_marker_id", "")
         n.setdefault("delay_marker_unit", "s")
+        n.setdefault("weather_metric", "temperature")
+        n.setdefault("weather_op", "gt")
+        n.setdefault("weather_value", "25")
+        n.setdefault("weather_state", "rain")
+        n.setdefault("weather_mode", "rise")
+        n.setdefault("weather_fire_start", False)
 
     return cfg
 
@@ -197,7 +216,7 @@ def save_config(cfg: dict) -> None:
 # Zeit-/Sonnen-/Datums-Bedingungen
 # --------------------------------------------------------------------------
 COND_LABELS = {"payload": "Payload", "time": "Uhrzeit", "sun": "Sonnenstand",
-               "weekday": "Wochentag", "date": "Datum", "marker": "Merker"}
+               "weekday": "Wochentag", "date": "Datum", "marker": "Merker", "weather": "Wetter"}
 
 
 def _parse_hhmm(text):
@@ -264,6 +283,94 @@ def is_sun_up(now, lat, lon, offset_min=0):
 
 
 _PLACEHOLDER = re.compile(r"\{payload(?:\.([^{}]+))?\}")
+
+
+# ---- Wetter aus dem Internet (Open-Meteo: kostenlos, ohne Anmeldung) ----
+WEATHER_API = os.environ.get("ABLAUF_WEATHER_API", "https://api.open-meteo.com/v1/forecast")
+WEATHER_FIELDS = ("temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,"
+                  "rain,showers,snowfall,weather_code,cloud_cover,wind_speed_10m,wind_gusts_10m")
+RAIN_CODES = {51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99}
+SNOW_CODES = {71, 73, 75, 77, 85, 86}
+WMO_TEXT = {
+    0: "klar", 1: "überwiegend klar", 2: "teils bewölkt", 3: "bedeckt", 45: "Nebel", 48: "Nebel mit Reif",
+    51: "leichter Nieselregen", 53: "Nieselregen", 55: "starker Nieselregen",
+    56: "leichter gefrierender Nieselregen", 57: "gefrierender Nieselregen",
+    61: "leichter Regen", 63: "Regen", 65: "starker Regen", 66: "leichter gefrierender Regen",
+    67: "gefrierender Regen", 71: "leichter Schneefall", 73: "Schneefall", 75: "starker Schneefall",
+    77: "Schneegriesel", 80: "leichte Regenschauer", 81: "Regenschauer", 82: "heftige Regenschauer",
+    85: "leichte Schneeschauer", 86: "starke Schneeschauer", 95: "Gewitter",
+    96: "Gewitter mit leichtem Hagel", 99: "Gewitter mit starkem Hagel",
+}
+WEATHER_METRICS = {"temperature": "temperature", "apparent_temperature": "apparent", "humidity": "humidity",
+                   "wind": "wind", "gusts": "gusts", "precipitation": "precipitation", "cloud": "cloud"}
+
+
+def weather_interval_sec(cfg):
+    try:
+        minutes = int((cfg.get("weather") or {}).get("interval_min", 10))
+    except (TypeError, ValueError):
+        minutes = 10
+    return max(5, min(120, minutes)) * 60
+
+
+def _ssl_context():
+    if certifi:
+        try:
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:  # noqa: BLE001
+            pass
+    return ssl.create_default_context()
+
+
+def fetch_weather(lat, lon, timeout=8):
+    """Ruft das aktuelle Wetter fuer eine Position ab (Open-Meteo, JSON)."""
+    if urlrequest is None:
+        raise RuntimeError("urllib.request fehlt (OpenWrt: opkg install python3-urllib)")
+    url = (f"{WEATHER_API}?latitude={lat:.4f}&longitude={lon:.4f}&current={WEATHER_FIELDS}"
+           f"&timezone=auto&wind_speed_unit=kmh")
+    request_obj = urlrequest.Request(url, headers={"User-Agent": "MQTT-Ablaufplaner"})
+    kwargs = {"timeout": timeout}
+    if url.startswith("https"):
+        kwargs["context"] = _ssl_context()
+    with urlrequest.urlopen(request_obj, **kwargs) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    cur = payload.get("current")
+    if not isinstance(cur, dict):
+        raise ValueError("Antwort ohne aktuelle Wetterdaten")
+
+    def num(key):
+        value = cur.get(key)
+        return float(value) if isinstance(value, (int, float)) else None
+
+    code = cur.get("weather_code")
+    code = int(code) if isinstance(code, (int, float)) else -1
+    flags = {
+        "rain": code in RAIN_CODES or (num("rain") or 0) > 0 or (num("showers") or 0) > 0,
+        "snow": code in SNOW_CODES or (num("snowfall") or 0) > 0,
+        "thunder": code in (95, 96, 99),
+        "fog": code in (45, 48),
+        "clear": code in (0, 1),
+        "cloudy": code in (2, 3),
+    }
+    return {"temperature": num("temperature_2m"), "apparent": num("apparent_temperature"),
+            "humidity": num("relative_humidity_2m"), "wind": num("wind_speed_10m"),
+            "gusts": num("wind_gusts_10m"), "precipitation": num("precipitation"),
+            "cloud": num("cloud_cover"), "code": code, "text": WMO_TEXT.get(code, "unbekannt"),
+            "flags": flags, "is_day": bool(cur.get("is_day")), "time": cur.get("time"),
+            "lat": lat, "lon": lon, "fetched": time.time()}
+
+
+def evaluate_weather(spec, data):
+    """Wertet eine Wetter-Angabe (Bedingung bzw. Ausloeser) gegen die aktuellen
+    Wetterdaten aus. Gibt (trifft_zu, Wert_als_Text) zurueck."""
+    metric = spec.get("weather_metric", "temperature")
+    if metric == "state":
+        has = bool(data["flags"].get(spec.get("weather_state", "rain"), False))
+        return (not has if spec.get("weather_op") == "not" else has), data["text"]
+    value = data.get(WEATHER_METRICS.get(metric, "temperature"))
+    if value is None:
+        return False, ""
+    return _compare(spec.get("weather_op", "gt"), value, spec.get("weather_value", "")), _fmt_num(float(value))
 
 
 def extract_json_field(payload_text, path):
@@ -345,7 +452,7 @@ def _compare(op, left, right):
     return False
 
 
-def evaluate_condition(node, payload_ctx, location, now=None, markers=None):
+def evaluate_condition(node, payload_ctx, location, now=None, markers=None, weather=None):
     """Wertet einen Bedingungs-Block aus und gibt True ("Ja") oder False
     ("Nein") zurueck."""
     try:
@@ -400,6 +507,12 @@ def evaluate_condition(node, payload_ctx, location, now=None, markers=None):
                 return a <= t <= b if a <= b else (t >= a or t <= b)
             return d1 <= today <= d2
 
+        if ctype == "weather":
+            data = weather() if callable(weather) else weather
+            if not data:
+                return False
+            return evaluate_weather(node, data)[0]
+
         if ctype == "marker":
             values = markers or {}
             mid = node.get("marker_id")
@@ -423,7 +536,7 @@ def evaluate_condition(node, payload_ctx, location, now=None, markers=None):
 # MQTT: einmaliges Veroeffentlichen (kurzlebige Verbindung pro Aufruf, damit
 # gleichzeitig laufende Ablaeufe sich nicht gegenseitig blockieren koennen)
 # --------------------------------------------------------------------------
-def evaluate_gate(node, payload_ctx, location, nodes_by_id, connections, markers, _stack=None, trace=None):
+def evaluate_gate(node, payload_ctx, location, nodes_by_id, connections, markers, _stack=None, trace=None, weather=None):
     """Wertet ein UND/ODER-Element aus. Gibt (ergebnis, details) zurueck;
     details ist eine Liste aus (Name, Ja/Nein) je verbundenem Eingang.
     Eingaenge sind Bedingungen oder weitere UND/ODER-Elemente, die ueber
@@ -441,10 +554,10 @@ def evaluate_gate(node, payload_ctx, location, nodes_by_id, connections, markers
             continue
         if src["type"] == "condition":
             name = src.get("label") or ("Bedingung " + COND_LABELS.get(src.get("cond_type", "payload"), ""))
-            result = evaluate_condition(src, payload_ctx, location, markers=markers)
+            result = evaluate_condition(src, payload_ctx, location, markers=markers, weather=weather)
         elif src["type"] in ("and", "or"):
             name = src.get("label") or ("UND" if src["type"] == "and" else "ODER")
-            result, _sub = evaluate_gate(src, payload_ctx, location, nodes_by_id, connections, markers, stack, trace)
+            result, _sub = evaluate_gate(src, payload_ctx, location, nodes_by_id, connections, markers, stack, trace, weather)
         else:
             continue
         if trace:
@@ -537,6 +650,13 @@ class FlowEngine:
         self._trace_lock = threading.RLock()
         self._trace_events = []               # Ablauf-Protokoll fuer die Anzeige
         self._trace_seq = 0
+        self._wlock = threading.RLock()       # Wetter-Zwischenspeicher
+        self._wfetch_lock = threading.Lock()  # nur ein Abruf gleichzeitig
+        self._weather = None
+        self._weather_error = ""
+        self._weather_state = {}              # Ausloeser-ID -> letztes Ergebnis
+        self._weather_seen = {}               # Ausloeser-ID -> zuletzt gesehener Abruf
+        self._weather_kick = threading.Event()
 
     def log_event(self, text: str) -> None:
         with self._events_lock:
@@ -555,6 +675,7 @@ class FlowEngine:
             self.sync_markers(cfg)
         except Exception as exc:  # noqa: BLE001
             self.log_event(f"Merker konnten nicht abgeglichen werden: {exc}")
+        self._weather_kick.set()
         with self._lock:
             in_nodes = [n for n in cfg["nodes"] if n["type"] == "mqtt_in" and n.get("broker_id") and n.get("topic")]
             needed_broker_ids = {n["broker_id"] for n in in_nodes}
@@ -639,6 +760,103 @@ class FlowEngine:
                 client.disconnect()
             except Exception:
                 pass
+
+    # ---- Wetter -----------------------------------------------------------
+    def get_weather(self, cfg=None, force=False):
+        """Liefert (Daten oder None, Fehlertext). Die Daten werden hoechstens im
+        eingestellten Intervall neu abgerufen; schlaegt ein Abruf fehl, werden
+        aeltere Daten (bis 1 Stunde) weiter verwendet."""
+        cfg = cfg or load_config()
+        loc = cfg.get("location") or {}
+        try:
+            lat, lon = float(loc.get("lat")), float(loc.get("lon"))
+        except (TypeError, ValueError):
+            return None, "Standort ungueltig"
+        ttl = weather_interval_sec(cfg)
+
+        def fresh(d):
+            return d is not None and d["lat"] == lat and d["lon"] == lon and time.time() - d["fetched"] < ttl
+
+        with self._wlock:
+            if not force and fresh(self._weather):
+                return self._weather, ""
+        with self._wfetch_lock:
+            with self._wlock:
+                if not force and fresh(self._weather):    # ein anderer Thread war schneller
+                    return self._weather, ""
+            try:
+                data = fetch_weather(lat, lon)
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc) or exc.__class__.__name__
+                with self._wlock:
+                    self._weather_error = message
+                    old = self._weather
+                    if old and old["lat"] == lat and old["lon"] == lon and time.time() - old["fetched"] < 3600:
+                        return old, message
+                return None, message
+            with self._wlock:
+                self._weather = data
+                self._weather_error = ""
+            return data, ""
+
+    def weather_data(self):
+        """Fuer Bedingungen: Wetterdaten oder None (mit Meldung im Protokoll)."""
+        data, err = self.get_weather()
+        if data is None:
+            self.log_event(f"Wetterdaten nicht verfuegbar: {err}")
+        return data
+
+    def weather_summary(self):
+        with self._wlock:
+            d = self._weather
+            return {"ok": d is not None and not self._weather_error, "error": self._weather_error,
+                    "data": d, "age": int(time.time() - d["fetched"]) if d else None}
+
+    def start_weather_poller(self):
+        threading.Thread(target=self._weather_loop, daemon=True).start()
+
+    def _weather_loop(self):
+        logged = None
+        while True:
+            try:
+                cfg = load_config()
+                nodes = [n for n in cfg["nodes"] if n["type"] == "weather_in"]
+                ids = {n["id"] for n in nodes}
+                for nid in list(self._weather_state):
+                    if nid not in ids:
+                        self._weather_state.pop(nid, None)
+                        self._weather_seen.pop(nid, None)
+                if nodes:
+                    data, err = self.get_weather(cfg)
+                    if err and err != logged:
+                        self.log_event(f"Wetter: Abruf fehlgeschlagen - {err}")
+                    logged = err or None
+                    if data:
+                        self._check_weather_triggers(nodes, data)
+            except Exception as exc:  # noqa: BLE001
+                self.log_event(f"Wetter-Abfrage: {exc}")
+            self._weather_kick.wait(60)
+            self._weather_kick.clear()
+
+    def _check_weather_triggers(self, nodes, data):
+        for n in nodes:
+            result, value = evaluate_weather(n, data)
+            prev = self._weather_state.get(n["id"])
+            new_data = self._weather_seen.get(n["id"]) != data["fetched"]
+            self._weather_seen[n["id"]] = data["fetched"]
+            mode = n.get("weather_mode", "rise")
+            if prev is None:                      # erster Abruf: nur auf Wunsch ausloesen
+                fire = result and bool(n.get("weather_fire_start"))
+            elif mode == "any":
+                fire = result != prev
+            elif mode == "while":
+                fire = result and new_data
+            else:
+                fire = result and not prev
+            self._weather_state[n["id"]] = result
+            if fire:
+                self.log_event(f"Wetter-Ausloeser '{n.get('label') or 'Wetter'}' ausgeloest (Wert: {value})")
+                threading.Thread(target=self.run_flow_from, args=(n["id"], value, "out"), daemon=True).start()
 
     # ---- Ablauf-Anzeige -------------------------------------------------
     def _trace(self, kind, **data):
@@ -830,7 +1048,7 @@ class FlowEngine:
                 if node.get("cond_type") == "marker" and node.get("marker_id"):
                     self._trace("ref", marker=node["marker_id"], target=node["id"])
                 ok = evaluate_condition(node, payload_ctx, load_config().get("location") or {},
-                                        markers=self.get_markers())
+                                        markers=self.get_markers(), weather=self.weather_data)
                 ctype = node.get("cond_type", "payload")
                 self.log_event(f"Bedingung '{node.get('label') or node['id']}' "
                                f"({COND_LABELS.get(ctype, ctype)}): {'Ja' if ok else 'Nein'}")
@@ -839,7 +1057,8 @@ class FlowEngine:
             if ntype in ("and", "or"):
                 ok, details = evaluate_gate(node, payload_ctx, load_config().get("location") or {},
                                             nodes_by_id or {}, connections or [], self.get_markers(),
-                                            trace=lambda cid, res: self._trace("data", conn=cid, result=res))
+                                            trace=lambda cid, res: self._trace("data", conn=cid, result=res),
+                                            weather=self.weather_data)
                 title = "UND" if ntype == "and" else "ODER"
                 name = node.get("label") or title
                 answer = "Ja" if ok else "Nein"
@@ -900,6 +1119,7 @@ def api_save_config():
     data.setdefault("connections", [])
     data.setdefault("location", DEFAULT_CONFIG["location"])
     data.setdefault("pages", DEFAULT_CONFIG["pages"])
+    data.setdefault("weather", DEFAULT_CONFIG["weather"])
     save_config(data)
     ENGINE.rebuild(data)
     return jsonify({"status": "ok"})
@@ -933,9 +1153,21 @@ def api_simulate(node_id):
     node = next((n for n in cfg["nodes"] if n["id"] == node_id), None)
     if not node:
         return jsonify({"error": "Block nicht gefunden."}), 404
+    if node["type"] == "weather_in" and not payload_ctx:   # aktuellen Wetterwert mitgeben
+        weather_now, _err = ENGINE.get_weather(cfg)
+        if weather_now:
+            payload_ctx = evaluate_weather(node, weather_now)[1]
     ENGINE.log_event(f"Simuliert: '{node.get('label') or node_id}'")
     threading.Thread(target=ENGINE.run_flow_from, args=(node_id, payload_ctx, "out"), daemon=True).start()
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/weather")
+def api_weather():
+    if request.args.get("refresh"):
+        ENGINE.get_weather(force=True)
+        ENGINE._weather_kick.set()      # Ausloeser sofort mit den neuen Daten pruefen
+    return jsonify(ENGINE.weather_summary())
 
 
 @app.route("/api/trace")
@@ -968,7 +1200,8 @@ def api_set_marker(marker_id):
 
 @app.route("/api/events")
 def api_events():
-    return jsonify({"events": ENGINE.get_events(), "markers": ENGINE.get_markers()})
+    return jsonify({"events": ENGINE.get_events(), "markers": ENGINE.get_markers(),
+                    "weather": ENGINE.weather_summary()})
 
 
 @app.route("/")
@@ -1029,7 +1262,7 @@ INDEX_HTML = r"""
   .pal-dot{ width:9px; height:9px; border-radius:50%; flex-shrink:0; }
   .dot-in{ background:var(--accent-2); } .dot-out{ background:var(--accent); }
   .dot-delay{ background:var(--text-dim); } .dot-cond{ background:var(--accent-3); }
-  .dot-marker{ background:#4cc9f0; } .dot-gate{ background:#f4d35e; }
+  .dot-marker{ background:#4cc9f0; } .dot-gate{ background:#f4d35e; } .dot-weather{ background:#7fd1ff; }
 
   .center{ flex:1; min-width:0; display:flex; flex-direction:column; }
   .tabs{ display:flex; align-items:flex-end; gap:2px; padding:6px 10px 0; background:var(--panel);
@@ -1066,6 +1299,7 @@ INDEX_HTML = r"""
   .flow-node.type-condition{ border-left:4px solid var(--accent-3); }
   .flow-node.type-marker{ border-left:4px solid #4cc9f0; }
   .flow-node.type-and, .flow-node.type-or{ border-left:4px solid #f4d35e; }
+  .flow-node.type-weather_in{ border-left:4px solid #7fd1ff; }
   .node-head{ display:flex; align-items:center; justify-content:space-between; padding:8px 10px;
               background:var(--panel-2); border-bottom:1px solid var(--border); border-radius:8px 8px 0 0;
               cursor:grab; font-size:12px; font-weight:600; }
@@ -1145,6 +1379,7 @@ INDEX_HTML = r"""
   <div class="header-actions">
     <button class="btn-ghost" onclick="openBrokerModal()">Broker</button>
     <button class="btn-ghost" onclick="openLocationModal()">Standort</button>
+    <button class="btn-ghost" onclick="openWeatherModal()">Wetter</button>
     <button class="btn" onclick="saveConfig(true)">Speichern</button>
   </div>
 </header>
@@ -1159,6 +1394,7 @@ INDEX_HTML = r"""
     <div class="pal-item" onclick="addNode('marker')"><span class="pal-dot dot-marker"></span>Merker</div>
     <div class="pal-item" onclick="addNode('and')"><span class="pal-dot dot-gate"></span>UND</div>
     <div class="pal-item" onclick="addNode('or')"><span class="pal-dot dot-gate"></span>ODER</div>
+    <div class="pal-item" onclick="addNode('weather_in')"><span class="pal-dot dot-weather"></span>Wetter (Auslöser)</div>
     <h3>Hinweise</h3>
     <div style="font-size:11.5px; color:var(--text-dim); line-height:1.6;">
       Block ziehen: am Kopf anfassen.<br>
@@ -1167,6 +1403,7 @@ INDEX_HTML = r"""
       Bearbeiten: auf den Blockinhalt klicken.<br>
       Merker: speichert einen Wert; Bedingungen und Wartezeiten koennen ihn verwenden. Die Verbindung zeigt eine gestrichelte Linie automatisch.<br>
       UND/ODER: den Ergebnis-Ausgang (&#9670; unten) von Bedingungen auf den Eingang (&#9670; oben) ziehen; der Ablauf geht dann ueber Ja/Nein weiter.<br>
+      Wetter (Internet): als Auslöser-Block oder als Bedingung (Typ Wetter); Standort über den Knopf oben rechts einstellen.<br>
       Seiten: oben mit + eine neue Seite anlegen, Doppelklick auf den Reiter benennt um. Merker gelten auf allen Seiten.<br>
       Loeschen: Block/Linie anklicken, dann &times; bzw. Entf.
     </div>
@@ -1250,6 +1487,7 @@ INDEX_HTML = r"""
         <option value="weekday">Wochentag</option>
         <option value="date">Datum</option>
         <option value="marker">Merker</option>
+        <option value="weather">Wetter (Internet)</option>
       </select>
 
       <div id="cond_payload">
@@ -1326,6 +1564,8 @@ INDEX_HTML = r"""
         </div>
       </div>
 
+      <div id="cond_weather"></div>
+
       <div id="cond_date">
         <label>Modus</label>
         <select id="date_mode" onchange="onCondTypeChange()">
@@ -1338,6 +1578,17 @@ INDEX_HTML = r"""
         </div>
         <div class="checkbox-line"><input type="checkbox" id="date_yearly"><label style="margin:0;">jährlich wiederkehrend (Jahr ignorieren)</label></div>
       </div>
+    </div>
+    <div id="fields_weather_in">
+      <div class="hint" style="margin-top:0;">Löst den Ablauf aus, sobald das Wetter laut Internet die Angabe erfüllt. Der Wert (z. B. 26.4 oder „Regen“) steht im Ablauf als {payload} zur Verfügung.</div>
+      <div id="wt_spec"></div>
+      <label>Auslösen</label>
+      <select id="wt_mode">
+        <option value="rise">einmal, sobald die Angabe zutrifft</option>
+        <option value="any">bei jedem Wechsel (zutreffend / nicht zutreffend)</option>
+        <option value="while">bei jedem Abruf, solange sie zutrifft</option>
+      </select>
+      <div class="checkbox-line"><input type="checkbox" id="wt_start"><label style="margin:0;">auch auslösen, wenn sie beim ersten Abruf schon zutrifft</label></div>
     </div>
     <div id="fields_and"><div class="hint" style="margin-top:0;">UND: Der Ablauf geht über „Ja“ weiter, wenn <b>alle</b> verbundenen Eingänge Ja ergeben, sonst über „Nein“. Verbinden: Ergebnis-Ausgang (&#9670; unten) einer Bedingung auf den Eingang (&#9670; oben) dieses Elements ziehen.</div></div>
     <div id="fields_or"><div class="hint" style="margin-top:0;">ODER: Der Ablauf geht über „Ja“ weiter, wenn <b>mindestens ein</b> verbundener Eingang Ja ergibt, sonst über „Nein“. Verbinden: Ergebnis-Ausgang (&#9670; unten) einer Bedingung auf den Eingang (&#9670; oben) dieses Elements ziehen.</div></div>
@@ -1398,6 +1649,20 @@ INDEX_HTML = r"""
   </div>
 </div>
 
+<!-- Wetter -->
+<div class="modal-backdrop" id="weatherModal">
+  <div class="modal" style="max-width:460px;">
+    <h2>Aktuelles Wetter (Internet)</h2>
+    <div id="weatherBody"></div>
+    <div class="modal-error" id="weatherError"></div>
+    <div class="hint">Quelle: Open-Meteo (kostenlos, ohne Anmeldung) für den eingestellten Standort. Die Daten werden höchstens im eingestellten Intervall neu abgerufen.</div>
+    <div class="actions">
+      <button class="btn-ghost" onclick="closeWeatherModal()">Schließen</button>
+      <button class="btn" onclick="refreshWeather(true)">Jetzt abrufen</button>
+    </div>
+  </div>
+</div>
+
 <!-- Auswahl verschieben -->
 <div class="modal-backdrop" id="moveModal">
   <div class="modal">
@@ -1411,12 +1676,15 @@ INDEX_HTML = r"""
 <!-- Standort-Modal -->
 <div class="modal-backdrop" id="locationModal">
   <div class="modal">
-    <h2>Standort (für Sonnenauf-/-untergang)</h2>
+    <h2>Standort &amp; Wetter</h2>
     <div class="row">
       <div><label>Breitengrad</label><input id="loc_lat" type="number" step="0.0001" min="-90" max="90"></div>
       <div><label>Längengrad</label><input id="loc_lon" type="number" step="0.0001" min="-180" max="180"></div>
     </div>
     <div class="hint">Beispiel Berlin: 52.5200 / 13.4050. Die Zeiten werden lokal berechnet (keine Internetverbindung nötig) und nutzen die Zeitzone des Rechners bzw. Routers.</div>
+    <label>Wetterabruf alle (Minuten)</label>
+    <input id="loc_interval" type="number" min="5" max="120" step="1">
+    <div class="hint">Gilt für Wetter-Auslöser und -Bedingungen (5 bis 120 Minuten). Zu häufige Abrufe belasten den kostenlosen Dienst.</div>
     <div class="modal-error" id="locError"></div>
     <div class="actions">
       <button class="btn-ghost" onclick="closeLocationModal()">Abbrechen</button>
@@ -1427,7 +1695,7 @@ INDEX_HTML = r"""
 
 <script>
 let STATE = { brokers: [], nodes: [], connections: [], location: { lat: 51.1657, lon: 10.4515 },
-              pages: [{ id: 'page_1', name: 'Seite 1' }] };
+              pages: [{ id: 'page_1', name: 'Seite 1' }], weather: { interval_min: 10 } };
 let selectedIds = new Set(), selectedConnId = null, editingNodeId = null;
 let dragGroup = null, marquee = null;
 let MARKER_VALUES = {};
@@ -1455,6 +1723,7 @@ const NODE_META = {
   delay:      { title: 'Wartezeit',      hasIn:true,  outs:['out'] },
   condition:  { title: 'Bedingung',      hasIn:true,  outs:['true','false'], dataOut:true },
   marker:     { title: 'Merker',         hasIn:true,  outs:['out'] },
+  weather_in: { title: 'Wetter-Auslöser', hasIn:false, outs:['out'] },
   and:        { title: 'UND',            hasIn:true,  outs:['true','false'], dataIn:true, dataOut:true },
   or:         { title: 'ODER',           hasIn:true,  outs:['true','false'], dataIn:true, dataOut:true },
 };
@@ -1472,6 +1741,7 @@ async function loadConfig(){
   const data = await res.json();
   STATE.brokers = data.brokers; STATE.nodes = data.nodes; STATE.connections = data.connections;
   if (data.pages && data.pages.length) STATE.pages = data.pages;
+  if (data.weather) STATE.weather = data.weather;
   let savedPage = null;
   try { savedPage = localStorage.getItem('ablaufPage'); } catch(e) {}
   currentPage = STATE.pages.some(p => p.id === savedPage) ? savedPage : STATE.pages[0].id;
@@ -1492,7 +1762,7 @@ async function saveConfig(showToast){
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ server: {host:'0.0.0.0', port:8020}, brokers: STATE.brokers,
                            nodes: STATE.nodes, connections: STATE.connections,
-                           location: STATE.location, pages: STATE.pages })
+                           location: STATE.location, pages: STATE.pages, weather: STATE.weather })
   });
   if (showToast){
     if (res.ok) toast('Gespeichert.'); else toast('Fehler beim Speichern.', false);
@@ -1513,7 +1783,9 @@ function addNode(type){
     date_mode:'equal', date_from:'', date_to:'', date_yearly:false,
     marker_initial:'0', marker_action:'set', marker_value:'1', marker_retain:false,
     marker_id:'', marker_op:'eq', marker_cmp:'',
-    delay_source:'fixed', delay_marker_id:'', delay_marker_unit:'s'
+    delay_source:'fixed', delay_marker_id:'', delay_marker_unit:'s',
+    weather_metric:'temperature', weather_op:'gt', weather_value:'25', weather_state:'rain',
+    weather_mode:'rise', weather_fire_start:false
   };
   if (type === 'marker') node.label = nextMarkerName();
   STATE.nodes.push(node);
@@ -1536,6 +1808,7 @@ function nodeSummary(n){
   if (n.type === 'condition') return condSummary(n);
   if (n.type === 'marker') return markerSummary(n);
   if (n.type === 'and' || n.type === 'or') return gateSummary(n);
+  if (n.type === 'weather_in') return weatherTriggerSummary(n);
   return '';
 }
 function opLabel(op){
@@ -1552,7 +1825,7 @@ function renderNodes(){
     div.style.left = n.x + 'px'; div.style.top = n.y + 'px';
     div.dataset.id = n.id;
 
-    const playBtn = n.type === 'mqtt_in' ? `<span class="node-play" onclick="simulateNode('${n.id}', event)">&#9654;</span>`
+    const playBtn = (n.type === 'mqtt_in' || n.type === 'weather_in') ? `<span class="node-play" onclick="simulateNode('${n.id}', event)">&#9654;</span>`
                   : n.type === 'marker' ? `<span class="node-play" title="Wert von Hand setzen" onclick="editMarkerValue('${n.id}', event)">&#9998;</span>` : '';
     div.innerHTML = `
       <div class="node-head" onmousedown="startDrag(event,'${n.id}')">
@@ -1710,6 +1983,7 @@ async function pollLog(){
     const data = await res.json();
     renderLog(data.events || []);
     if (data.markers){ MARKER_VALUES = data.markers; updateMarkerValues(); }
+    if (data.weather){ WEATHER = data.weather; updateWeatherLive(); }
   } catch(e){}
 }
 
@@ -1902,7 +2176,7 @@ function deleteConnById(id){
 
 async function simulateNode(id, e){
   e.stopPropagation();
-  const payload = prompt('Test-Payload fuer dieses Ereignis:', '');
+  const payload = (nodeById(id) || {}).type === 'weather_in' ? '' : prompt('Test-Payload fuer dieses Ereignis:', '');
   if (payload === null) return;
   await fetch(`/api/nodes/${id}/simulate`, { method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ payload }) });
@@ -1923,7 +2197,7 @@ function openNodeModal(id){
   document.getElementById('nodeError').style.display = 'none';
   document.getElementById('nodeModalTitle').textContent = NODE_META[n.type].title + ' bearbeiten';
   document.getElementById('n_label').value = n.label || '';
-  ['fields_mqtt_in','fields_mqtt_out','fields_delay','fields_condition','fields_marker','fields_and','fields_or'].forEach(id2 => {
+  ['fields_mqtt_in','fields_mqtt_out','fields_delay','fields_condition','fields_marker','fields_and','fields_or','fields_weather_in'].forEach(id2 => {
     document.getElementById(id2).style.display = (id2 === 'fields_' + n.type) ? 'block' : 'none';
   });
   if (n.type === 'mqtt_in'){
@@ -1942,6 +2216,8 @@ function openNodeModal(id){
     loadCondFields(n);
   } else if (n.type === 'marker'){
     loadMarkerFields(n);
+  } else if (n.type === 'weather_in'){
+    loadWeatherTrigger(n);
   }
   document.getElementById('nodeModal').classList.add('show');
 }
@@ -1972,6 +2248,8 @@ function submitNode(){
     if (!readCondFields(n, errEl)) return;
   } else if (n.type === 'marker'){
     if (!readMarkerFields(n, errEl, prevLabel)) return;
+  } else if (n.type === 'weather_in'){
+    if (!readWeatherTrigger(n, errEl)) return;
   }
   closeNodeModal();
   renderAll(); scheduleSave();
@@ -2015,6 +2293,7 @@ function condSummary(n){
     if (n.date_mode === 'between') return `Datum <b>${escapeHtml(n.date_from||'-')} bis ${escapeHtml(n.date_to||'-')}</b>${y}`;
     return `Datum ist <b>${escapeHtml(n.date_from||'-')}</b>${y}`;
   }
+  if (t === 'weather') return `Wetter (Internet): <b>${escapeHtml(weatherSpecText(n))}</b>`;
   const OPS = {eq:'=', neq:'&ne;', contains:'enthält', gt:'&gt;', gte:'&ge;', lt:'&lt;', lte:'&le;'};
   if (t === 'marker'){
     const m = nodeById(n.marker_id);
@@ -2029,7 +2308,7 @@ function condSummary(n){
 
 function onCondTypeChange(){
   const t = document.getElementById('cond_type').value;
-  ['payload','time','sun','weekday','date','marker'].forEach(k => {
+  ['payload','time','sun','weekday','date','marker','weather'].forEach(k => {
     document.getElementById('cond_' + k).style.display = (k === t) ? 'block' : 'none';
   });
   const tm = document.getElementById('time_mode').value;
@@ -2062,6 +2341,7 @@ function loadCondFields(n){
   fillMarkerSelect(document.getElementById('cond_marker_sel'), n.marker_id);
   document.getElementById('cond_m_op').value = n.marker_op || 'eq';
   document.getElementById('cond_m_value').value = n.marker_cmp || '';
+  loadWeatherSpec('cw', n);
   onCondTypeChange();
 }
 
@@ -2093,6 +2373,8 @@ function readCondFields(n, errEl){
     if (mode === 'between' && !to) return fail('Bitte Start- und Enddatum angeben.');
     n.date_mode = mode; n.date_from = from; if (mode === 'between') n.date_to = to;
     n.date_yearly = document.getElementById('date_yearly').checked;
+  } else if (t === 'weather'){
+    if (!readWeatherSpec('cw', n, fail)) return false;
   } else if (t === 'marker'){
     const mid = document.getElementById('cond_marker_sel').value;
     if (!mid) return fail('Bitte einen Merker auswählen (zuerst einen Merker-Block platzieren).');
@@ -2114,6 +2396,7 @@ function openLocationModal(){
   document.getElementById('locError').style.display = 'none';
   document.getElementById('loc_lat').value = STATE.location.lat;
   document.getElementById('loc_lon').value = STATE.location.lon;
+  document.getElementById('loc_interval').value = (STATE.weather || {}).interval_min || 10;
   document.getElementById('locationModal').classList.add('show');
 }
 function closeLocationModal(){ document.getElementById('locationModal').classList.remove('show'); }
@@ -2125,6 +2408,8 @@ function submitLocation(){
     errEl.textContent = 'Bitte gültige Koordinaten eingeben (Breite -90..90, Länge -180..180).';
     errEl.style.display = 'block'; return;
   }
+  const iv = parseInt(document.getElementById('loc_interval').value);
+  STATE.weather = { interval_min: Math.min(120, Math.max(5, isNaN(iv) ? 10 : iv)) };
   STATE.location = { lat, lon };
   closeLocationModal(); scheduleSave(); toast('Standort gespeichert.');
 }
@@ -2484,6 +2769,155 @@ async function pollTrace(){
   } catch(e){}
 }
 
+// ---------------- Wetter (Internet) ----------------
+let WEATHER = { ok: false, error: '', data: null, age: null };
+const WEATHER_LABELS = {
+  temperature: ['Temperatur', '°C'], apparent_temperature: ['Gefühlte Temperatur', '°C'],
+  humidity: ['Luftfeuchtigkeit', '%'], wind: ['Wind', 'km/h'], gusts: ['Böen', 'km/h'],
+  precipitation: ['Niederschlag', 'mm'], cloud: ['Bewölkung', '%']
+};
+const WEATHER_KEYS = { temperature:'temperature', apparent_temperature:'apparent', humidity:'humidity',
+                       wind:'wind', gusts:'gusts', precipitation:'precipitation', cloud:'cloud' };
+const WEATHER_STATES = { rain:'es regnet', snow:'es schneit', thunder:'Gewitter', fog:'Nebel',
+                         clear:'klar / heiter', cloudy:'bewölkt' };
+
+function weatherSpecText(n){
+  const m = n.weather_metric || 'temperature';
+  if (m === 'state') return (n.weather_op === 'not' ? 'nicht: ' : '') + (WEATHER_STATES[n.weather_state] || n.weather_state);
+  const lbl = WEATHER_LABELS[m] || [m, ''];
+  const ops = { gt:'>', gte:'≥', lt:'<', lte:'≤', eq:'=' };
+  return `${lbl[0]} ${ops[n.weather_op] || '>'} ${n.weather_value} ${lbl[1]}`.trim();
+}
+function weatherNowText(metric){
+  const d = WEATHER.data;
+  if (!d) return '-';
+  if (metric === 'state') return d.text || '-';
+  const v = d[WEATHER_KEYS[metric]];
+  return (v === null || v === undefined) ? '-' : `${v} ${(WEATHER_LABELS[metric] || ['', ''])[1]}`.trim();
+}
+function weatherTriggerSummary(n){
+  const modes = { rise:'einmal beim Eintreten', any:'bei jedem Wechsel', while:'bei jedem Abruf, solange zutreffend' };
+  const metric = n.weather_metric || 'temperature';
+  return `Wenn <b>${escapeHtml(weatherSpecText(n))}</b><br>${modes[n.weather_mode || 'rise']}<br>`
+       + `Jetzt: <b class="weather-now" data-metric="${metric}">${escapeHtml(weatherNowText(metric))}</b>`;
+}
+function updateWeatherLive(){
+  document.querySelectorAll('.weather-now').forEach(el => { el.textContent = weatherNowText(el.dataset.metric); });
+  if (document.getElementById('weatherModal').classList.contains('show')) renderWeatherModal();
+}
+
+function weatherSpecHtml(p){
+  return `
+    <label>Wetterwert</label>
+    <select id="${p}_metric" onchange="onWeatherSpecChange('${p}')">
+      <option value="temperature">Temperatur (°C)</option>
+      <option value="apparent_temperature">Gefühlte Temperatur (°C)</option>
+      <option value="humidity">Luftfeuchtigkeit (%)</option>
+      <option value="wind">Windgeschwindigkeit (km/h)</option>
+      <option value="gusts">Windböen (km/h)</option>
+      <option value="precipitation">Niederschlag aktuell (mm)</option>
+      <option value="cloud">Bewölkung (%)</option>
+      <option value="state">Wetterlage (Regen, Schnee ...)</option>
+    </select>
+    <div id="${p}_num">
+      <label>Bedingung</label>
+      <select id="${p}_op">
+        <option value="gt">größer als</option><option value="gte">größer oder gleich</option>
+        <option value="lt">kleiner als</option><option value="lte">kleiner oder gleich</option>
+        <option value="eq">gleich</option>
+      </select>
+      <label>Wert</label>
+      <input id="${p}_value" placeholder="z. B. 25">
+    </div>
+    <div id="${p}_state">
+      <label>Wetterlage</label>
+      <select id="${p}_st">
+        <option value="rain">es regnet (Regen, Nieselregen, Schauer, Gewitter)</option>
+        <option value="snow">es schneit</option>
+        <option value="thunder">Gewitter</option>
+        <option value="fog">Nebel</option>
+        <option value="clear">klar / überwiegend klar</option>
+        <option value="cloudy">bewölkt / bedeckt</option>
+      </select>
+      <select id="${p}_is" style="margin-top:8px;">
+        <option value="is">trifft zu</option><option value="not">trifft nicht zu</option>
+      </select>
+    </div>
+    <div class="hint">Daten: Open-Meteo (Internet) für den Standort oben rechts („Standort“). Bei Ausfall der Verbindung gilt „Nein“.</div>`;
+}
+document.getElementById('cond_weather').innerHTML = weatherSpecHtml('cw');
+document.getElementById('wt_spec').innerHTML = weatherSpecHtml('wt');
+
+function onWeatherSpecChange(p){
+  const state = document.getElementById(p + '_metric').value === 'state';
+  document.getElementById(p + '_num').style.display = state ? 'none' : 'block';
+  document.getElementById(p + '_state').style.display = state ? 'block' : 'none';
+}
+function loadWeatherSpec(p, n){
+  const metric = n.weather_metric || 'temperature';
+  document.getElementById(p + '_metric').value = metric;
+  const opSel = document.getElementById(p + '_op');
+  opSel.value = ['gt','gte','lt','lte','eq'].includes(n.weather_op) ? n.weather_op : 'gt';
+  document.getElementById(p + '_value').value = n.weather_value ?? '25';
+  document.getElementById(p + '_st').value = n.weather_state || 'rain';
+  document.getElementById(p + '_is').value = n.weather_op === 'not' ? 'not' : 'is';
+  onWeatherSpecChange(p);
+}
+function readWeatherSpec(p, n, fail){
+  const metric = document.getElementById(p + '_metric').value;
+  if (metric === 'state'){
+    n.weather_state = document.getElementById(p + '_st').value;
+    n.weather_op = document.getElementById(p + '_is').value;
+  } else {
+    const val = document.getElementById(p + '_value').value;
+    if (isNaN(parseFloat(val.replace(',', '.')))) return fail('Bitte eine Zahl als Wert angeben.');
+    n.weather_op = document.getElementById(p + '_op').value;
+    n.weather_value = val;
+  }
+  n.weather_metric = metric;
+  return true;
+}
+function loadWeatherTrigger(n){
+  loadWeatherSpec('wt', n);
+  document.getElementById('wt_mode').value = n.weather_mode || 'rise';
+  document.getElementById('wt_start').checked = !!n.weather_fire_start;
+}
+function readWeatherTrigger(n, errEl){
+  const fail = (msg) => { errEl.textContent = msg; errEl.style.display = 'block'; return false; };
+  if (!readWeatherSpec('wt', n, fail)) return false;
+  n.weather_mode = document.getElementById('wt_mode').value;
+  n.weather_fire_start = document.getElementById('wt_start').checked;
+  return true;
+}
+
+async function refreshWeather(force){
+  try{
+    const res = await fetch('/api/weather' + (force ? '?refresh=1' : ''));
+    WEATHER = await res.json();
+  } catch(e){ WEATHER = { ok:false, error:'Server nicht erreichbar', data:null, age:null }; }
+  updateWeatherLive(); renderWeatherModal();
+}
+function openWeatherModal(){
+  document.getElementById('weatherModal').classList.add('show');
+  renderWeatherModal();
+  refreshWeather(false);
+}
+function closeWeatherModal(){ document.getElementById('weatherModal').classList.remove('show'); }
+function renderWeatherModal(){
+  const body = document.getElementById('weatherBody'), err = document.getElementById('weatherError');
+  err.style.display = WEATHER.error ? 'block' : 'none';
+  err.textContent = WEATHER.error ? 'Abruf fehlgeschlagen: ' + WEATHER.error : '';
+  const d = WEATHER.data;
+  if (!d){ body.innerHTML = '<div class="hint">Noch keine Wetterdaten abgerufen.</div>'; return; }
+  const f = (v, unit) => (v === null || v === undefined) ? '-' : `${v} ${unit}`;
+  const rows = [['Wetterlage', d.text], ['Temperatur', f(d.temperature, '°C')], ['Gefühlt', f(d.apparent, '°C')],
+    ['Luftfeuchtigkeit', f(d.humidity, '%')], ['Wind', f(d.wind, 'km/h')], ['Böen', f(d.gusts, 'km/h')],
+    ['Niederschlag', f(d.precipitation, 'mm')], ['Bewölkung', f(d.cloud, '%')], ['Tag/Nacht', d.is_day ? 'Tag' : 'Nacht']];
+  body.innerHTML = `<table class="broker-table">` + rows.map(r =>
+      `<tr><td>${escapeHtml(r[0])}</td><td><b>${escapeHtml(String(r[1]))}</b></td></tr>`).join('') + `</table>`
+    + `<div class="hint">Stand: vor ${WEATHER.age} s (Meldezeit ${escapeHtml(d.time || '-')}), Ort ${d.lat} / ${d.lon}</div>`;
+}
+
 // ---------------- Broker-Modal ----------------
 function openBrokerModal(){
   document.getElementById('brokerError').style.display='none';
@@ -2547,6 +2981,7 @@ def main():
         ENGINE.rebuild(cfg)
     except Exception as exc:  # noqa: BLE001
         print(f" [WARNUNG] MQTT-Engine konnte nicht gestartet werden: {exc}")
+    ENGINE.start_weather_poller()
     host = cfg["server"].get("host", "0.0.0.0")
     port = int(cfg["server"].get("port", 8020))
     print("=" * 64)
