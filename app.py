@@ -51,7 +51,7 @@ Erreichbar unter:      http://<IP-DES-PCS>:8020  (im gesamten LAN)
 #   PATCH (x.x.+1) -> Bugfix, keine neuen Funktionen
 #   MINOR (x.+1.0) -> neue Funktion, abwaertskompatibel
 #   MAJOR (+1.0.0) -> Breaking Change (z. B. Config-Format aendert sich)
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 import os
 import sys
@@ -320,6 +320,34 @@ def _ssl_context():
         except Exception:  # noqa: BLE001
             pass
     return ssl.create_default_context()
+
+
+GEOCODE_API = os.environ.get("ABLAUF_GEOCODE_API", "https://geocoding-api.open-meteo.com/v1/search")
+
+
+def geocode_city(query, count=6, timeout=8):
+    """Sucht Orte nach Namen (Open-Meteo-Geocoding, kein Schluessel noetig).
+    Gibt eine Liste mit name, label, lat, lon zurueck."""
+    if urlrequest is None:
+        raise RuntimeError("urllib.request fehlt (OpenWrt: opkg install python3-urllib)")
+    from urllib.parse import quote
+    url = f"{GEOCODE_API}?name={quote(query.strip())}&count={int(count)}&language=de&format=json"
+    request_obj = urlrequest.Request(url, headers={"User-Agent": "MQTT-Ablaufplaner"})
+    kwargs = {"timeout": timeout}
+    if url.startswith("https"):
+        kwargs["context"] = _ssl_context()
+    with urlrequest.urlopen(request_obj, **kwargs) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    out = []
+    for r in payload.get("results") or []:
+        try:
+            lat, lon = float(r["latitude"]), float(r["longitude"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        parts = [r.get("name") or "", r.get("admin1") or "", r.get("country") or ""]
+        label = ", ".join(p for p in parts if p)
+        out.append({"name": r.get("name") or label, "label": label, "lat": round(lat, 4), "lon": round(lon, 4)})
+    return out
 
 
 def fetch_weather(lat, lon, timeout=8):
@@ -1162,6 +1190,17 @@ def api_simulate(node_id):
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/geocode")
+def api_geocode():
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 2:
+        return jsonify({"ok": False, "error": "Bitte mindestens 2 Zeichen eingeben.", "results": []})
+    try:
+        return jsonify({"ok": True, "error": "", "results": geocode_city(q)})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"Ortssuche nicht moeglich: {exc}", "results": []})
+
+
 @app.route("/api/weather")
 def api_weather():
     if request.args.get("refresh"):
@@ -1304,10 +1343,14 @@ INDEX_HTML = r"""
               background:var(--panel-2); border-bottom:1px solid var(--border); border-radius:8px 8px 0 0;
               cursor:grab; font-size:12px; font-weight:600; }
   .node-head:active{ cursor:grabbing; }
+  .node-head > span:first-child{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+                                 white-space:nowrap; padding-right:28px; }
+  .node-del{ flex:none; }
   .node-del{ color:var(--text-dim); cursor:pointer; font-size:14px; line-height:1; }
   .node-del:hover{ color:var(--danger); }
   .node-body{ padding:8px 10px 10px; font-family:var(--mono); font-size:10.5px; color:var(--text-dim);
-              line-height:1.5; cursor:pointer; }
+              line-height:1.5; cursor:pointer; overflow:hidden; overflow-wrap:anywhere;
+              word-break:break-word; box-sizing:border-box; max-width:100%; }
   .node-body b{ color:var(--text); font-weight:500; }
   .node-play{ position:absolute; top:6px; right:24px; font-size:11px; color:var(--text-dim); cursor:pointer; }
   .node-play:hover{ color:var(--accent-2); }
@@ -1677,9 +1720,17 @@ INDEX_HTML = r"""
 <div class="modal-backdrop" id="locationModal">
   <div class="modal">
     <h2>Standort &amp; Wetter</h2>
+    <label>Stadt oder Ort</label>
+    <div style="display:flex;gap:8px;">
+      <input id="loc_city" type="text" placeholder="z. B. Hamburg" style="flex:1"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();searchCity();}">
+      <button class="btn-ghost" type="button" onclick="searchCity()">Suchen</button>
+    </div>
+    <select id="loc_results" size="1" style="display:none;margin-top:8px;width:100%" onchange="pickCity()"></select>
+    <div class="hint" id="loc_hint">Ort eingeben und &quot;Suchen&quot; klicken (benötigt Internet) - die Koordinaten werden automatisch eingetragen. Alternativ unten von Hand eingeben.</div>
     <div class="row">
-      <div><label>Breitengrad</label><input id="loc_lat" type="number" step="0.0001" min="-90" max="90"></div>
-      <div><label>Längengrad</label><input id="loc_lon" type="number" step="0.0001" min="-180" max="180"></div>
+      <div><label>Breitengrad</label><input id="loc_lat" type="number" step="0.0001" min="-90" max="90" oninput="coordsEdited()"></div>
+      <div><label>Längengrad</label><input id="loc_lon" type="number" step="0.0001" min="-180" max="180" oninput="coordsEdited()"></div>
     </div>
     <div class="hint">Beispiel Berlin: 52.5200 / 13.4050. Die Zeiten werden lokal berechnet (keine Internetverbindung nötig) und nutzen die Zeitzone des Rechners bzw. Routers.</div>
     <label>Wetterabruf alle (Minuten)</label>
@@ -2392,16 +2443,63 @@ function readCondFields(n, errEl){
 }
 
 // ---------------- Standort-Modal ----------------
+let locFound = [];
 function openLocationModal(){
   document.getElementById('locError').style.display = 'none';
   document.getElementById('loc_lat').value = STATE.location.lat;
   document.getElementById('loc_lon').value = STATE.location.lon;
+  document.getElementById('loc_city').value = STATE.location.name || '';
+  document.getElementById('loc_results').style.display = 'none';
+  locFound = [];
   document.getElementById('loc_interval').value = (STATE.weather || {}).interval_min || 10;
   document.getElementById('locationModal').classList.add('show');
 }
 function closeLocationModal(){ document.getElementById('locationModal').classList.remove('show'); }
-function submitLocation(){
+function coordsEdited(){ document.getElementById('loc_city').value = ''; }   // Koordinaten von Hand: Ortsname entfaellt
+function applyCity(r){
+  document.getElementById('loc_lat').value = r.lat;
+  document.getElementById('loc_lon').value = r.lon;
+  document.getElementById('loc_city').value = r.name;
+  document.getElementById('loc_hint').textContent = 'Gefunden: ' + r.label + ' (' + r.lat + ' / ' + r.lon + ')';
+}
+async function findCity(){
+  const q = document.getElementById('loc_city').value.trim();
   const errEl = document.getElementById('locError');
+  errEl.style.display = 'none';
+  const res = await fetch('/api/geocode?q=' + encodeURIComponent(q));
+  const data = await res.json();
+  if (!data.ok){ errEl.textContent = data.error; errEl.style.display = 'block'; return []; }
+  if (!data.results.length){ errEl.textContent = 'Kein Ort "' + q + '" gefunden.'; errEl.style.display = 'block'; return []; }
+  return data.results;
+}
+async function searchCity(){
+  const sel = document.getElementById('loc_results');
+  locFound = await findCity();
+  if (!locFound.length){ sel.style.display = 'none'; return; }
+  sel.innerHTML = '';
+  locFound.forEach((r, i) => {
+    const o = document.createElement('option');
+    o.value = i; o.textContent = r.label + '  (' + r.lat + ' / ' + r.lon + ')';
+    sel.appendChild(o);
+  });
+  sel.style.display = locFound.length > 1 ? 'block' : 'none';
+  sel.size = Math.min(locFound.length, 6);
+  sel.selectedIndex = 0;
+  applyCity(locFound[0]);
+}
+function pickCity(){
+  const r = locFound[parseInt(document.getElementById('loc_results').value)];
+  if (r) applyCity(r);
+}
+async function submitLocation(){
+  const errEl = document.getElementById('locError');
+  // Stadt eingetragen, aber nicht gesucht/geaendert: beim Speichern automatisch das erste Ergebnis nehmen
+  const city = document.getElementById('loc_city').value.trim();
+  if (city && city !== (STATE.location.name || '') && !locFound.some(r => r.name === city)){
+    const found = await findCity();
+    if (!found.length) return;
+    applyCity(found[0]);
+  }
   const lat = parseFloat(document.getElementById('loc_lat').value);
   const lon = parseFloat(document.getElementById('loc_lon').value);
   if (isNaN(lat) || isNaN(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180){
@@ -2411,6 +2509,8 @@ function submitLocation(){
   const iv = parseInt(document.getElementById('loc_interval').value);
   STATE.weather = { interval_min: Math.min(120, Math.max(5, isNaN(iv) ? 10 : iv)) };
   STATE.location = { lat, lon };
+  const nm = document.getElementById('loc_city').value.trim();
+  if (nm) STATE.location.name = nm;
   closeLocationModal(); scheduleSave(); toast('Standort gespeichert.');
 }
 

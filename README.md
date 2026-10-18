@@ -7,7 +7,7 @@ Blockschaltbild zu entwerfen - Bloecke werden per Klick auf die
 Zeichenflaeche gelegt, per Drag & Drop positioniert und durch Linien zu
 einem Ablauf verschaltet (aehnlich Node-RED).
 
-**Aktuelle Version: v1.7.0**
+**Aktuelle Version: v1.8.0**
 
 ## Bloecke
 
@@ -55,9 +55,9 @@ Bedienung:
 **Wetter (Internet):** Das aktuelle Wetter am eingestellten Standort kommt von [Open-Meteo](https://open-meteo.com) (kein Schluessel noetig, nur fuer nicht-kommerzielle Nutzung). Es gibt zwei Einsatzarten:
 - **Bedingung** vom Typ *Wetter (Internet)*: z. B. `Temperatur > 25` oder `Wetterlage ist Regen` - danach geht es ueber "Ja"/"Nein" weiter (Rolladen runter, wenn es heisser als 25 Grad ist).
 - **Ausloeser** "Wetter (Ausloeser)": startet einen Ablauf von selbst. Modus *Beim Zutreffen* (nur beim Wechsel von "nein" auf "ja"), *Bei jeder Aenderung* oder *Solange zutreffend* (bei jeder Abfrage); optional schon beim Programmstart. Beispiel: es regnet -> Licht an.
-Messwerte: Temperatur, gefuehlte Temperatur, Luftfeuchte, Wind, Windboeen, Niederschlag, Bewoelkung sowie Wetterlagen (Regen, Schnee, Gewitter, Nebel, klar, bewoelkt). Abfrageintervall 5-120 Minuten (Standard 10) im Dialog "Standort & Wetter"; der Knopf "Wetter" zeigt die aktuellen Werte. Bei Internetausfall werden die letzten Werte bis zu einer Stunde weiterverwendet, danach ergibt die Bedingung "Nein" und das Ereignisprotokoll nennt den Fehler. Hinweis: Es gibt keine Hysterese - schwankt ein Wert um die Schwelle, kann ein Ausloeser mehrfach feuern.
+Der Standort kann als Stadtname eingegeben werden. Messwerte: Temperatur, gefuehlte Temperatur, Luftfeuchte, Wind, Windboeen, Niederschlag, Bewoelkung sowie Wetterlagen (Regen, Schnee, Gewitter, Nebel, klar, bewoelkt). Abfrageintervall 5-120 Minuten (Standard 10) im Dialog "Standort & Wetter"; der Knopf "Wetter" zeigt die aktuellen Werte. Bei Internetausfall werden die letzten Werte bis zu einer Stunde weiterverwendet, danach ergibt die Bedingung "Nein" und das Ereignisprotokoll nennt den Fehler. Hinweis: Es gibt keine Hysterese - schwankt ein Wert um die Schwelle, kann ein Ausloeser mehrfach feuern.
 
-Fuer die Sonnen-Bedingung den **Standort** (Knopf oben rechts) einstellen - Auf-/Untergang werden lokal berechnet (keine Internetverbindung noetig). Uhrzeit, Wochentag, Datum und Sonne verwenden die **Zeitzone des Rechners/Routers**.
+Fuer die Sonnen-Bedingung den **Standort** (Knopf oben rechts) einstellen - entweder per **Stadtname** (Feld "Stadt oder Ort" + "Suchen", bei mehreren Treffern den passenden auswaehlen; die Ortssuche nutzt Open-Meteo und braucht Internet) oder mit Koordinaten von Hand - Auf-/Untergang werden lokal berechnet (keine Internetverbindung noetig). Uhrzeit, Wochentag, Datum und Sonne verwenden die **Zeitzone des Rechners/Routers**.
 
 Alle Broker, Bloecke und Verbindungen werden lesbar in `config.json`
 gespeichert (liegt neben dem Skript bzw. der exe/App) und koennen bei
