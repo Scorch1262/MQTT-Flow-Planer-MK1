@@ -26,13 +26,16 @@ Block-Typen:
     koennen den Wert auswerten, Wartezeiten ihn als Dauer verwenden. Auf
     Wunsch bleibt der Wert nach einem Neustart erhalten (markers.json).
 
-  - UND / ODER: verknuepfen mehrere Bedingungen. Die Ergebnis-Ausgaenge
-    von Bedingungen (oder anderen UND/ODER-Elementen) werden ueber
-    gestrichelte Datenlinien mit dem Eingang des UND/ODER-Elements
-    verbunden. Erreicht der Ablauf das Element, werden alle Eingaenge
-    ausgewertet; der Ablauf geht bei UND ueber "Ja" weiter, wenn alle
-    Eingaenge Ja sind, bei ODER, wenn mindestens einer Ja ist - sonst
-    ueber "Nein".
+  - Bedingung: zwei oder mehr Eingaenge, zwei Ausgaenge (Ja/Nein). Im
+    Standardtyp "Eingaenge vergleichen" werden die Werte der angeschlossenen
+    Bloecke (MQTT-Empfang, Merker, Rechnen, Wetter ...) verglichen.
+
+  - UND / ODER: eigenstaendig, zwei oder mehr Eingaenge, ein Ausgang. Jeder
+    Block (auch Merker, MQTT-Empfang, Wetter, Rechnen) kann direkt als
+    Eingang angeschlossen werden - es ist keine Bedingung noetig.
+
+  - Rechnen: verrechnet die Werte von zwei oder mehr Eingaengen
+    (+, -, *, /, Rest, Potenz, Minimum, Maximum, Mittelwert).
 
 Die komplette Verschaltung (Broker, Bloecke, Verbindungen, Ansicht)
 wird menschenlesbar in "config.json" gespeichert, die im selben
@@ -51,7 +54,7 @@ Erreichbar unter:      http://<IP-DES-PCS>:8020  (im gesamten LAN)
 #   PATCH (x.x.+1) -> Bugfix, keine neuen Funktionen
 #   MINOR (x.+1.0) -> neue Funktion, abwaertskompatibel
 #   MAJOR (+1.0.0) -> Breaking Change (z. B. Config-Format aendert sich)
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 
 import os
 import sys
@@ -63,6 +66,7 @@ import uuid
 import math
 import re
 import threading
+import types
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, request, jsonify, Response
@@ -114,6 +118,7 @@ DEFAULT_CONFIG = {
     "location": {"lat": 51.1657, "lon": 10.4515},
     "pages": [{"id": "page_1", "name": "Seite 1"}],
     "weather": {"interval_min": 10},
+    "schema": 2,
     "brokers": [],
     "nodes": [],
     "connections": []
@@ -140,7 +145,28 @@ def load_config() -> dict:
     cfg.setdefault("location", copy.deepcopy(DEFAULT_CONFIG["location"]))
     for c in cfg["connections"]:
         c.setdefault("from_port", "out")
-        c.setdefault("to_port", "in")   # "data" = Datenlinie zu einem UND/ODER-Element
+        c.setdefault("to_port", "in")
+    if int(cfg.get("schema", 1) or 1) < 2:
+        # Umstellung v1.9.0: keine Datenlinien/Ergebnis-Ausgaenge mehr. UND/ODER
+        # haben beliebig viele Eingaenge und genau einen Ausgang. Alte Linien, die
+        # nur den Ablauf in ein UND/ODER fuehrten, bleiben reine Ausloeser
+        # (trigger_only), damit sich bestehende Ablaeufe nicht veraendern.
+        gates = {n["id"] for n in cfg["nodes"] if n.get("type") in ("and", "or")}
+        migrated = []
+        for c in cfg["connections"]:
+            if c.get("to_port") == "data":
+                c["to_port"] = "in"
+                if c.get("from_port") == "result":
+                    c["from_port"] = "true"
+            elif c.get("to") in gates:
+                c["trigger_only"] = True
+            if c.get("from") in gates:
+                if c.get("from_port") == "false":
+                    continue
+                c["from_port"] = "out"
+            migrated.append(c)
+        cfg["connections"] = migrated
+        cfg["schema"] = 2
     if not isinstance(cfg.get("weather"), dict):
         cfg["weather"] = {"interval_min": 10}
     cfg["weather"].setdefault("interval_min", 10)
@@ -200,6 +226,10 @@ def load_config() -> dict:
         n.setdefault("weather_state", "rain")
         n.setdefault("weather_mode", "rise")
         n.setdefault("weather_fire_start", False)
+        n.setdefault("math_op", "add")
+        n.setdefault("math_const", "0")
+        n.setdefault("math_round", "")
+        n.setdefault("gate_output", "true")
 
     return cfg
 
@@ -215,7 +245,10 @@ def save_config(cfg: dict) -> None:
 # --------------------------------------------------------------------------
 # Zeit-/Sonnen-/Datums-Bedingungen
 # --------------------------------------------------------------------------
-COND_LABELS = {"payload": "Payload", "time": "Uhrzeit", "sun": "Sonnenstand",
+NODE_TITLES = {"mqtt_in": "MQTT Empfangen", "mqtt_out": "MQTT Senden", "delay": "Wartezeit",
+               "condition": "Bedingung", "marker": "Merker", "weather_in": "Wetter",
+               "and": "UND", "or": "ODER", "math": "Rechnen"}
+COND_LABELS = {"inputs": "Eingaenge", "payload": "Payload", "time": "Uhrzeit", "sun": "Sonnenstand",
                "weekday": "Wochentag", "date": "Datum", "marker": "Merker", "weather": "Wetter"}
 
 
@@ -480,6 +513,72 @@ def _compare(op, left, right):
     return False
 
 
+def value_truthy(value):
+    """Wahrheitswert eines beliebigen Werts: Zahl ungleich 0 oder 1/true/on/an/ja ..."""
+    if value is None:
+        return False
+    number = _to_float(value)
+    if number is not None:
+        return number != 0
+    return is_truthy(value)
+
+
+def _short(value, limit=24):
+    text = "-" if value is None else str(value)
+    return text if len(text) <= limit else text[:limit - 1] + "..."
+
+
+MATH_SYMBOLS = {"add": "+", "sub": "-", "mul": "*", "div": "/", "mod": "mod", "pow": "^",
+                "min": "min", "max": "max", "avg": "Mittel"}
+CMP_SYMBOLS = {"eq": "=", "neq": "!=", "contains": "enthaelt", "gt": ">", "gte": ">=",
+               "lt": "<", "lte": "<=", "true": "ist wahr", "false": "ist falsch"}
+LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def math_fold(op, nums):
+    """Verrechnet mehrere Zahlen von links nach rechts."""
+    if op == "add":
+        result = sum(nums)
+    elif op == "sub":
+        result = nums[0] - sum(nums[1:])
+    elif op == "mul":
+        result = 1.0
+        for n in nums:
+            result *= n
+    elif op in ("div", "mod"):
+        result = nums[0]
+        for n in nums[1:]:
+            if n == 0:
+                raise ZeroDivisionError("Division durch 0")
+            result = result / n if op == "div" else result % n
+    elif op == "pow":
+        result = nums[0]
+        for n in nums[1:]:
+            result = result ** n
+        if isinstance(result, complex):
+            raise ValueError("Ergebnis ist keine reelle Zahl")
+    elif op == "min":
+        result = min(nums)
+    elif op == "max":
+        result = max(nums)
+    elif op == "avg":
+        result = sum(nums) / len(nums)
+    else:
+        raise ValueError(f"Unbekannte Rechenart {op!r}")
+    if not math.isfinite(result):
+        raise ValueError("Ergebnis ist keine endliche Zahl")
+    return result
+
+
+def format_math(result, digits):
+    """Zahl als Text: auf 'digits' Nachkommastellen gerundet (None = automatisch)."""
+    try:
+        d = None if digits in (None, "") else max(0, min(6, int(float(digits))))
+    except (TypeError, ValueError):
+        d = None
+    return _fmt_num(round(result, 6 if d is None else d))
+
+
 def evaluate_condition(node, payload_ctx, location, now=None, markers=None, weather=None):
     """Wertet einen Bedingungs-Block aus und gibt True ("Ja") oder False
     ("Nein") zurueck."""
@@ -564,40 +663,6 @@ def evaluate_condition(node, payload_ctx, location, now=None, markers=None, weat
 # MQTT: einmaliges Veroeffentlichen (kurzlebige Verbindung pro Aufruf, damit
 # gleichzeitig laufende Ablaeufe sich nicht gegenseitig blockieren koennen)
 # --------------------------------------------------------------------------
-def evaluate_gate(node, payload_ctx, location, nodes_by_id, connections, markers, _stack=None, trace=None, weather=None):
-    """Wertet ein UND/ODER-Element aus. Gibt (ergebnis, details) zurueck;
-    details ist eine Liste aus (Name, Ja/Nein) je verbundenem Eingang.
-    Eingaenge sind Bedingungen oder weitere UND/ODER-Elemente, die ueber
-    Datenlinien (to_port == "data") angeschlossen sind. Ohne Eingaenge ist
-    das Ergebnis Nein; Kreise zwischen Elementen werden als Nein gewertet."""
-    stack = set(_stack or ()) | {node["id"]}
-    details = []
-    for c in connections:
-        if c.get("to") != node["id"] or c.get("to_port") != "data":
-            continue
-        src = nodes_by_id.get(c.get("from"))
-        if not src or src["id"] in stack:
-            if src:
-                details.append((src.get("label") or "Kreis", False))
-            continue
-        if src["type"] == "condition":
-            name = src.get("label") or ("Bedingung " + COND_LABELS.get(src.get("cond_type", "payload"), ""))
-            result = evaluate_condition(src, payload_ctx, location, markers=markers, weather=weather)
-        elif src["type"] in ("and", "or"):
-            name = src.get("label") or ("UND" if src["type"] == "and" else "ODER")
-            result, _sub = evaluate_gate(src, payload_ctx, location, nodes_by_id, connections, markers, stack, trace, weather)
-        else:
-            continue
-        if trace:
-            trace(c.get("id", ""), result)
-        details.append((name, result))
-    if not details:
-        return False, []
-    values = [r for _name, r in details]
-    ok = all(values) if node["type"] == "and" else any(values)
-    return ok, details
-
-
 def make_mqtt_client(client_id):
     """Erzeugt einen MQTT-Client und funktioniert sowohl mit paho-mqtt 2.x
     als auch mit aelteren 1.x-Versionen (z. B. aus den opkg-Paketen von
@@ -685,6 +750,7 @@ class FlowEngine:
         self._weather_state = {}              # Ausloeser-ID -> letztes Ergebnis
         self._weather_seen = {}               # Ausloeser-ID -> zuletzt gesehener Abruf
         self._weather_kick = threading.Event()
+        self._values = {}                     # zuletzt empfangener Wert je Block (z. B. MQTT-Empfang)
 
     def log_event(self, text: str) -> None:
         with self._events_lock:
@@ -762,6 +828,7 @@ class FlowEngine:
             matches = [n for n in cfg["nodes"]
                        if n["type"] == "mqtt_in" and n.get("broker_id") == bid and n.get("topic") == msg.topic]
             for node in matches:
+                self._values[node["id"]] = payload_str      # Wert steht danach als Eingang bereit
                 required = (node.get("payload") or "").strip()
                 if not required or payload_str == required:
                     self.log_event(f"Ereignis '{node.get('label') or node['id']}' ausgeloest ({msg.topic})")
@@ -1003,6 +1070,145 @@ class FlowEngine:
                 new = current
             return self.set_marker(node, new)
 
+    # ---- Eingaenge / Werte (Bedingung, UND/ODER, Rechnen) -------------
+    @staticmethod
+    def _node_name(node):
+        return node.get("label") or NODE_TITLES.get(node["type"], node["type"])
+
+    @staticmethod
+    def _inputs_of(node, g):
+        """Alle Linien, die in den Block fuehren (in der Reihenfolge der Konfiguration =
+        A, B, C ...). Reine Ausloeser-Linien aelterer Dateien zaehlen nicht."""
+        return [c for c in g.conns if c.get("to") == node["id"] and not c.get("trigger_only")
+                and g.nodes.get(c.get("from"))]
+
+    def _emit_input(self, conn, result, label):
+        """Zeigt in der Weboberflaeche, dass ueber diese Linie ein Wert gelesen wurde."""
+        if conn.get("id") and conn.get("id") != getattr(self._tl, "edge", None):
+            self._trace("data", conn=conn["id"], result=result, label=label)
+
+    def _value(self, src, ctx, g, stack=()):
+        """Aktueller Wert eines Blocks als Text (None = noch kein Wert)."""
+        if src["id"] in stack:
+            return None
+        stack = tuple(stack) + (src["id"],)
+        t = src["type"]
+        if t == "marker":
+            with self._mlock:
+                return self.markers.get(src["id"])
+        if t == "weather_in":
+            data = self.weather_data()
+            return evaluate_weather(src, data)[1] if data else None
+        if t == "math":
+            return self._math(src, ctx, g, stack)[0]
+        if t == "condition":
+            return "1" if self._cond_result(src, ctx, g, stack)[0] else "0"
+        if t in ("and", "or"):
+            return "1" if self._gate(src, ctx, g, stack)[0] else "0"
+        return self._values.get(src["id"])
+
+    def _truth(self, src, port, ctx, g, stack):
+        """Ja/Nein-Wert eines Blocks, wenn er als Eingang eines UND/ODER dient."""
+        if src["id"] in stack:
+            return False
+        t = src["type"]
+        inner = tuple(stack) + (src["id"],)
+        if t == "condition":
+            result = self._cond_result(src, ctx, g, inner)[0]
+            return (not result) if port == "false" else result
+        if t in ("and", "or"):
+            return self._gate(src, ctx, g, inner)[0]
+        if t == "weather_in":
+            data = self.weather_data()
+            return bool(data) and evaluate_weather(src, data)[0]
+        return value_truthy(self._value(src, ctx, g, stack))
+
+    def _cond_result(self, node, ctx, g, stack, emit=False):
+        """Wertet eine Bedingung aus. Gibt (Ja/Nein, Detailtext) zurueck."""
+        ctype = node.get("cond_type", "payload")
+        if ctype != "inputs":
+            if ctype == "marker" and node.get("marker_id") and emit:
+                self._trace("ref", marker=node["marker_id"], target=node["id"])
+            ok = evaluate_condition(node, ctx, g.location, markers=self.get_markers(),
+                                    weather=self.weather_data)
+            return ok, ""
+        ins = self._inputs_of(node, g)
+        op = node.get("operator", "eq")
+        values = []
+        for c in ins:
+            src = g.nodes[c["from"]]
+            values.append(self._value(src, ctx, g, stack))
+        if values and values[0] is None:
+            values[0] = ctx                      # Eingang ohne eigenen Wert: Wert des laufenden Ablaufs
+        for c, v in zip(ins, values):
+            if emit:
+                self._emit_input(c, None, _short(v, 12))
+        if not ins:
+            return False, "keine Eingaenge"
+        for i, v in enumerate(values):
+            if v is None:
+                return False, f"Eingang {LETTERS[i % 26]} ({self._node_name(g.nodes[ins[i]['from']])}) hat noch keinen Wert"
+        sym = CMP_SYMBOLS.get(op, op)
+        if op in ("true", "false"):
+            want = op == "true"
+            ok = all(value_truthy(v) == want for v in values)
+            return ok, " ; ".join(f"{LETTERS[i % 26]}={_short(v)}" for i, v in enumerate(values)) + f" {sym}"
+        if len(values) == 1:
+            other = node.get("compare_value", "")
+            return _compare(op, values[0], other), f"{_short(values[0])} {sym} {_short(other)}"
+        ok = all(_compare(op, values[i], values[i + 1]) for i in range(len(values) - 1))
+        return ok, f" {sym} ".join(_short(v) for v in values)
+
+    def _gate(self, node, ctx, g, stack, emit=False):
+        """UND/ODER: Gibt (Ergebnis, [(Name, Ja/Nein), ...]) zurueck."""
+        details = []
+        for c in self._inputs_of(node, g):
+            src = g.nodes[c["from"]]
+            res = self._truth(src, c.get("from_port", "out"), ctx, g, stack)
+            details.append((self._node_name(src), res))
+            if emit:
+                self._emit_input(c, res, "Ja" if res else "Nein")
+        if not details:
+            return False, []
+        values = [r for _name, r in details]
+        return (all(values) if node["type"] == "and" else any(values)), details
+
+    def _math(self, node, ctx, g, stack, emit=False):
+        """Rechnen: Gibt (Ergebnis-Text oder None, Detailtext/Fehlergrund) zurueck."""
+        ins = self._inputs_of(node, g)
+        if not ins:
+            return None, "keine Eingaenge verbunden"
+        nums = []
+        for i, c in enumerate(ins):
+            src = g.nodes[c["from"]]
+            raw = self._value(src, ctx, g, stack)
+            if emit:
+                self._emit_input(c, None, _short(raw, 12))
+            letter = LETTERS[i % 26]
+            if raw is None:
+                return None, f"Eingang {letter} ({self._node_name(src)}) hat noch keinen Wert"
+            number = _to_float(raw)
+            if number is None:
+                return None, f"Eingang {letter} ({self._node_name(src)}) ist keine Zahl: {_short(raw, 30)!r}"
+            nums.append(number)
+        op = node.get("math_op", "add")
+        if len(nums) == 1:
+            const = _to_float(node.get("math_const", "0"))
+            if const is None:
+                return None, f"Konstante {node.get('math_const')!r} ist keine Zahl"
+            nums.append(const)
+        try:
+            result = math_fold(op, nums)
+        except (ArithmeticError, ValueError) as exc:
+            return None, str(exc)
+        text = format_math(result, node.get("math_round", ""))
+        sym = MATH_SYMBOLS.get(op, op)
+        if op in ("min", "max", "avg"):
+            expr = f"{sym}({'; '.join(_fmt_num(n) for n in nums)})"
+        else:
+            expr = f" {sym} ".join(_fmt_num(n) for n in nums)
+        return text, f"{expr} = {text}"
+
     def _delay_seconds(self, node: dict) -> float:
         """Wartezeit in Sekunden - als Festwert oder aus einem Merker-Wert."""
         fixed = max(0.0, float(node.get("delay_sec", 1.0) or 0))
@@ -1028,12 +1234,15 @@ class FlowEngine:
         nodes_by_id = {n["id"]: n for n in cfg["nodes"]}
         brokers_by_id = {b["id"]: b for b in cfg["brokers"]}
         visited = set()
+        self._tl.g = types.SimpleNamespace(nodes=nodes_by_id, brokers=brokers_by_id,
+                                           conns=cfg["connections"], location=cfg.get("location") or {})
+        self._tl.edge = None
+        self._values[start_node_id] = payload_ctx
         self._walk(start_node_id, start_port, payload_ctx, nodes_by_id, brokers_by_id,
                    cfg["connections"], visited)
 
     def _walk(self, node_id, from_port, payload_ctx, nodes_by_id, brokers_by_id, connections, visited):
-        edges = [c for c in connections if c["from"] == node_id and c.get("from_port", "out") == from_port
-                 and c.get("to_port", "in") != "data"]
+        edges = [c for c in connections if c["from"] == node_id and c.get("from_port", "out") == from_port]
         for edge in edges:
             target = nodes_by_id.get(edge["to"])
             if not target:
@@ -1044,11 +1253,15 @@ class FlowEngine:
             visited.add(guard)
             self._trace("edge", conn=edge.get("id", ""), frm=node_id, port=from_port, to=target["id"])
             self._trace("enter", node=target["id"])
+            self._tl.edge = edge.get("id")
+            self._tl.out_payload = None
             next_port = self._execute(target, payload_ctx, brokers_by_id, nodes_by_id, connections)
+            out_payload = self._tl.out_payload
+            next_ctx = payload_ctx if out_payload is None else out_payload
+            self._values[target["id"]] = next_ctx
             self._trace("leave", node=target["id"], result=next_port or "stop")
-            payload_ctx = self._last_payload if hasattr(self, "_last_payload") else payload_ctx
             if next_port:
-                self._walk(target["id"], next_port, payload_ctx, nodes_by_id, brokers_by_id, connections, visited)
+                self._walk(target["id"], next_port, next_ctx, nodes_by_id, brokers_by_id, connections, visited)
 
     def _execute(self, node: dict, payload_ctx: str, brokers_by_id: dict,
                  nodes_by_id: dict = None, connections: list = None) -> str:
@@ -1072,30 +1285,40 @@ class FlowEngine:
                 time.sleep(self._delay_seconds(node))
                 return "out"
 
+            g = getattr(self._tl, "g", None) or types.SimpleNamespace(
+                nodes=nodes_by_id or {}, brokers=brokers_by_id, conns=connections or [],
+                location=load_config().get("location") or {})
+            name = node.get("label") or node["id"]
+
             if ntype == "condition":
-                if node.get("cond_type") == "marker" and node.get("marker_id"):
-                    self._trace("ref", marker=node["marker_id"], target=node["id"])
-                ok = evaluate_condition(node, payload_ctx, load_config().get("location") or {},
-                                        markers=self.get_markers(), weather=self.weather_data)
+                ok, detail = self._cond_result(node, payload_ctx, g, (node["id"],), emit=True)
                 ctype = node.get("cond_type", "payload")
-                self.log_event(f"Bedingung '{node.get('label') or node['id']}' "
-                               f"({COND_LABELS.get(ctype, ctype)}): {'Ja' if ok else 'Nein'}")
+                extra = f" [{detail}]" if detail else ""
+                self.log_event(f"Bedingung '{name}' ({COND_LABELS.get(ctype, ctype)}){extra}: "
+                               f"{'Ja' if ok else 'Nein'}")
                 return "true" if ok else "false"
 
             if ntype in ("and", "or"):
-                ok, details = evaluate_gate(node, payload_ctx, load_config().get("location") or {},
-                                            nodes_by_id or {}, connections or [], self.get_markers(),
-                                            trace=lambda cid, res: self._trace("data", conn=cid, result=res),
-                                            weather=self.weather_data)
+                ok, details = self._gate(node, payload_ctx, g, (node["id"],), emit=True)
                 title = "UND" if ntype == "and" else "ODER"
-                name = node.get("label") or title
-                answer = "Ja" if ok else "Nein"
                 if details:
                     parts = "; ".join(d_name + "=" + ("Ja" if d_res else "Nein") for d_name, d_res in details)
-                    self.log_event(f"{title} '{name}' ({parts}): {answer}")
+                    self.log_event(f"{title} '{name}' ({parts}): {'Ja' if ok else 'Nein'}")
                 else:
                     self.log_event(f"{title} '{name}': keine Eingaenge verbunden - Ergebnis Nein")
-                return "true" if ok else "false"
+                if node.get("gate_output") == "always":
+                    self._tl.out_payload = "1" if ok else "0"
+                    return "out"
+                return "out" if ok else None
+
+            if ntype == "math":
+                text, detail = self._math(node, payload_ctx, g, (node["id"],), emit=True)
+                if text is None:
+                    self.log_event(f"Rechnen '{name}': {detail} - Zweig beendet")
+                    return None
+                self.log_event(f"Rechnen '{name}': {detail}")
+                self._tl.out_payload = text
+                return "out"
 
             if ntype == "marker":
                 new = self.apply_marker_action(node, payload_ctx)
@@ -1148,6 +1371,7 @@ def api_save_config():
     data.setdefault("location", DEFAULT_CONFIG["location"])
     data.setdefault("pages", DEFAULT_CONFIG["pages"])
     data.setdefault("weather", DEFAULT_CONFIG["weather"])
+    data["schema"] = 2
     save_config(data)
     ENGINE.rebuild(data)
     return jsonify({"status": "ok"})
@@ -1301,7 +1525,7 @@ INDEX_HTML = r"""
   .pal-dot{ width:9px; height:9px; border-radius:50%; flex-shrink:0; }
   .dot-in{ background:var(--accent-2); } .dot-out{ background:var(--accent); }
   .dot-delay{ background:var(--text-dim); } .dot-cond{ background:var(--accent-3); }
-  .dot-marker{ background:#4cc9f0; } .dot-gate{ background:#f4d35e; } .dot-weather{ background:#7fd1ff; }
+  .dot-marker{ background:#4cc9f0; } .dot-gate{ background:#f4d35e; } .dot-weather{ background:#7fd1ff; } .dot-math{ background:#ff8fd1; }
 
   .center{ flex:1; min-width:0; display:flex; flex-direction:column; }
   .tabs{ display:flex; align-items:flex-end; gap:2px; padding:6px 10px 0; background:var(--panel);
@@ -1339,6 +1563,7 @@ INDEX_HTML = r"""
   .flow-node.type-marker{ border-left:4px solid #4cc9f0; }
   .flow-node.type-and, .flow-node.type-or{ border-left:4px solid #f4d35e; }
   .flow-node.type-weather_in{ border-left:4px solid #7fd1ff; }
+  .flow-node.type-math{ border-left:4px solid #ff8fd1; }
   .node-head{ display:flex; align-items:center; justify-content:space-between; padding:8px 10px;
               background:var(--panel-2); border-bottom:1px solid var(--border); border-radius:8px 8px 0 0;
               cursor:grab; font-size:12px; font-weight:600; }
@@ -1365,9 +1590,6 @@ INDEX_HTML = r"""
   .port-label{ position:absolute; font-family:var(--mono); font-size:9px; color:var(--text-dim); }
   .port-label.true{ right:14px; top:28%; color:var(--accent-2); }
   .port-label.false{ right:14px; top:60%; color:var(--danger); }
-  .port-data-in, .port-data-out{ border-radius:2px; border-color:#4cc9f0; transform:rotate(45deg); }
-  .port-data-in{ left:50%; top:-6px; margin-left:-5.5px; }
-  .port-data-out{ left:75%; bottom:-6px; margin-left:-5.5px; }
 
   .side{ width:270px; border-left:1px solid var(--border); background:var(--panel); padding:14px;
          overflow-y:auto; flex-shrink:0; }
@@ -1437,6 +1659,7 @@ INDEX_HTML = r"""
     <div class="pal-item" onclick="addNode('marker')"><span class="pal-dot dot-marker"></span>Merker</div>
     <div class="pal-item" onclick="addNode('and')"><span class="pal-dot dot-gate"></span>UND</div>
     <div class="pal-item" onclick="addNode('or')"><span class="pal-dot dot-gate"></span>ODER</div>
+    <div class="pal-item" onclick="addNode('math')"><span class="pal-dot dot-math"></span>Rechnen</div>
     <div class="pal-item" onclick="addNode('weather_in')"><span class="pal-dot dot-weather"></span>Wetter (Auslöser)</div>
     <h3>Hinweise</h3>
     <div style="font-size:11.5px; color:var(--text-dim); line-height:1.6;">
@@ -1444,8 +1667,9 @@ INDEX_HTML = r"""
       Mehrere Bloecke: auf leerer Flaeche einen Rahmen aufziehen und die markierten Bloecke gemeinsam am Kopf ziehen. Umschalt/Strg + Klick auf den Kopf fuegt hinzu bzw. entfernt, Strg+A waehlt alle, Esc hebt die Auswahl auf.<br>
       Verbinden: am rechten Punkt ziehen, auf linken Punkt eines anderen Blocks loslassen.<br>
       Bearbeiten: auf den Blockinhalt klicken.<br>
-      Merker: speichert einen Wert; Bedingungen und Wartezeiten koennen ihn verwenden. Die Verbindung zeigt eine gestrichelte Linie automatisch.<br>
-      UND/ODER: den Ergebnis-Ausgang (&#9670; unten) von Bedingungen auf den Eingang (&#9670; oben) ziehen; der Ablauf geht dann ueber Ja/Nein weiter.<br>
+      Eingaenge: Jeder Block kann an den linken Punkt von Bedingung, UND, ODER und Rechnen angeschlossen werden (auch mehrere). Bei Bedingung und Rechnen stehen A, B, C ... an den Linien.<br>
+      Bedingung: zwei oder mehr Eingaenge, Ausgaenge Ja/Nein. UND/ODER: beliebig viele Eingaenge, ein Ausgang. Rechnen: +, -, *, / usw. der Eingangswerte.<br>
+      Merker: laesst sich ueberall anschliessen - als Eingang (sein Wert) und als Ziel (setzen, speichern ...). Bedingungen und Wartezeiten koennen ihn auch ueber den Dialog waehlen (gestrichelte Linie automatisch).<br>
       Wetter (Internet): als Auslöser-Block oder als Bedingung (Typ Wetter); Standort über den Knopf oben rechts einstellen.<br>
       Seiten: oben mit + eine neue Seite anlegen, Doppelklick auf den Reiter benennt um. Merker gelten auf allen Seiten.<br>
       Loeschen: Block/Linie anklicken, dann &times; bzw. Entf.
@@ -1524,6 +1748,7 @@ INDEX_HTML = r"""
     <div id="fields_condition">
       <label>Bedingung prüfen auf</label>
       <select id="cond_type" onchange="onCondTypeChange()">
+        <option value="inputs">Eingänge vergleichen (einfach)</option>
         <option value="payload">Nachrichteninhalt (Payload)</option>
         <option value="time">Uhrzeit</option>
         <option value="sun">Sonne aufgegangen / untergegangen</option>
@@ -1532,6 +1757,28 @@ INDEX_HTML = r"""
         <option value="marker">Merker</option>
         <option value="weather">Wetter (Internet)</option>
       </select>
+
+      <div id="cond_inputs">
+        <div class="hint" id="ci_info" style="margin-top:0;"></div>
+        <label>Vergleich</label>
+        <select id="ci_op" onchange="onCondTypeChange()">
+          <option value="eq">ist gleich (=)</option>
+          <option value="neq">ist ungleich (≠)</option>
+          <option value="contains">enthält</option>
+          <option value="gt">ist größer als (&gt;)</option>
+          <option value="gte">ist größer oder gleich (≥)</option>
+          <option value="lt">ist kleiner als (&lt;)</option>
+          <option value="lte">ist kleiner oder gleich (≤)</option>
+          <option value="true">ist wahr (1 / true / on / Zahl ≠ 0)</option>
+          <option value="false">ist falsch (0 / off / leer)</option>
+        </select>
+        <div id="ci_value_wrap">
+          <label>Vergleichswert (wird genutzt, wenn nur ein Eingang angeschlossen ist)</label>
+          <input id="ci_value" placeholder="z. B. 25">
+        </div>
+        <div class="hint">Zwei Eingänge: A wird mit B verglichen (z. B. A &gt; B). Bei drei oder mehr Eingängen muss der Vergleich für jedes aufeinanderfolgende Paar gelten (A &lt; B &lt; C). Die Eingänge sind die Werte der angeschlossenen Blöcke: MQTT-Empfang (letzte Nachricht), Merker, Rechnen, Wetter ...</div>
+        <button class="btn-mini" type="button" onclick="swapInputs(editingNodeId); document.getElementById('ci_info').innerHTML = inputsInfoHtml(editingNodeId)">Eingänge A/B tauschen</button>
+      </div>
 
       <div id="cond_payload">
         <label>Vergleichsoperator</label>
@@ -1633,8 +1880,36 @@ INDEX_HTML = r"""
       </select>
       <div class="checkbox-line"><input type="checkbox" id="wt_start"><label style="margin:0;">auch auslösen, wenn sie beim ersten Abruf schon zutrifft</label></div>
     </div>
-    <div id="fields_and"><div class="hint" style="margin-top:0;">UND: Der Ablauf geht über „Ja“ weiter, wenn <b>alle</b> verbundenen Eingänge Ja ergeben, sonst über „Nein“. Verbinden: Ergebnis-Ausgang (&#9670; unten) einer Bedingung auf den Eingang (&#9670; oben) dieses Elements ziehen.</div></div>
-    <div id="fields_or"><div class="hint" style="margin-top:0;">ODER: Der Ablauf geht über „Ja“ weiter, wenn <b>mindestens ein</b> verbundener Eingang Ja ergibt, sonst über „Nein“. Verbinden: Ergebnis-Ausgang (&#9670; unten) einer Bedingung auf den Eingang (&#9670; oben) dieses Elements ziehen.</div></div>
+    <div id="fields_and"><div class="hint" style="margin-top:0;">UND: Beliebig viele Blöcke (Bedingung, Merker, MQTT-Empfang, Wetter, Rechnen, UND/ODER ...) direkt an den linken Punkt anschließen. Der Ausgang löst aus, wenn <b>alle</b> Eingänge Ja ergeben. Als „Ja“ gilt: Bedingung erfüllt, Merker bzw. Nachricht wahr (1 / true / on / Zahl ≠ 0), Wetter trifft zu. Geprüft wird, sobald über eine der Linien ein Ablauf ankommt.</div></div>
+    <div id="fields_or"><div class="hint" style="margin-top:0;">ODER: Beliebig viele Blöcke (Bedingung, Merker, MQTT-Empfang, Wetter, Rechnen, UND/ODER ...) direkt an den linken Punkt anschließen. Der Ausgang löst aus, wenn <b>mindestens ein</b> Eingang Ja ergibt. Als „Ja“ gilt: Bedingung erfüllt, Merker bzw. Nachricht wahr (1 / true / on / Zahl ≠ 0), Wetter trifft zu. Geprüft wird, sobald über eine der Linien ein Ablauf ankommt.</div></div>
+    <div id="fields_gate_opts">
+      <label>Ausgang</label>
+      <select id="gate_output">
+        <option value="true">löst nur bei „Ja“ aus (Standard)</option>
+        <option value="always">löst immer aus (Nachricht 1 = Ja, 0 = Nein)</option>
+      </select>
+    </div>
+    <div id="fields_math">
+      <div class="hint" id="math_info" style="margin-top:0;"></div>
+      <label>Rechenart</label>
+      <select id="math_op" onchange="onMathChange()">
+        <option value="add">Addieren (A + B + ...)</option>
+        <option value="sub">Subtrahieren (A − B − ...)</option>
+        <option value="mul">Multiplizieren (A × B × ...)</option>
+        <option value="div">Dividieren (A ÷ B ÷ ...)</option>
+        <option value="mod">Rest der Division (A mod B)</option>
+        <option value="pow">Potenz (A hoch B)</option>
+        <option value="min">Minimum</option>
+        <option value="max">Maximum</option>
+        <option value="avg">Mittelwert</option>
+      </select>
+      <label>Konstante (wird genutzt, wenn nur ein Eingang angeschlossen ist)</label>
+      <input id="math_const" placeholder="z. B. 10">
+      <label>Nachkommastellen (leer = automatisch)</label>
+      <input id="math_round" type="number" min="0" max="6" step="1" placeholder="automatisch">
+      <div class="hint">Das Ergebnis läuft als Nachricht weiter (z. B. in „MQTT Senden“ als <code>{payload}</code>) und steht anderen Blöcken (Merker, Bedingung, weiteres Rechnen) als Wert zur Verfügung. Zwei oder mehr Eingänge: Werte von MQTT-Empfang, Merkern, Wetter oder anderem Rechnen.</div>
+      <button class="btn-mini" type="button" onclick="swapInputs(editingNodeId); document.getElementById('math_info').innerHTML = inputsInfoHtml(editingNodeId)">Eingänge A/B tauschen</button>
+    </div>
     <div id="fields_marker">
       <div class="hint" style="margin-top:0;">Ein Merker speichert einen Wert. Läuft ein Ablauf in diesen Block, wird die Aktion ausgeführt. Bedingungen und Wartezeiten können den Wert verwenden. Die Bezeichnung oben ist der Name des Merkers.</div>
       <label>Aktueller Wert (live)</label>
@@ -1772,11 +2047,12 @@ const NODE_META = {
   mqtt_in:    { title: 'MQTT Empfangen', hasIn:false, outs:['out'] },
   mqtt_out:   { title: 'MQTT Senden',    hasIn:true,  outs:['out'] },
   delay:      { title: 'Wartezeit',      hasIn:true,  outs:['out'] },
-  condition:  { title: 'Bedingung',      hasIn:true,  outs:['true','false'], dataOut:true },
+  condition:  { title: 'Bedingung',      hasIn:true,  outs:['true','false'] },
   marker:     { title: 'Merker',         hasIn:true,  outs:['out'] },
   weather_in: { title: 'Wetter-Auslöser', hasIn:false, outs:['out'] },
-  and:        { title: 'UND',            hasIn:true,  outs:['true','false'], dataIn:true, dataOut:true },
-  or:         { title: 'ODER',           hasIn:true,  outs:['true','false'], dataIn:true, dataOut:true },
+  and:        { title: 'UND',            hasIn:true,  outs:['out'] },
+  or:         { title: 'ODER',           hasIn:true,  outs:['out'] },
+  math:       { title: 'Rechnen',        hasIn:true,  outs:['out'] },
 };
 
 async function loadVersion(){
@@ -1829,14 +2105,15 @@ function addNode(type){
     type, x: 60 + (count % 6) * 40, y: 60 + Math.floor(count/6) * 120,
     label:'', broker_id:'', topic:'', payload:'', qos:0, retain:false,
     delay_sec:1.0, operator:'eq', compare_value:'',
-    cond_type:'payload', time_mode:'between', time_from:'08:00', time_to:'18:00',
+    cond_type:'inputs', time_mode:'between', time_from:'08:00', time_to:'18:00',
     sun_state:'up', sun_offset_min:0, weekdays:[0,1,2,3,4],
     date_mode:'equal', date_from:'', date_to:'', date_yearly:false,
     marker_initial:'0', marker_action:'set', marker_value:'1', marker_retain:false,
     marker_id:'', marker_op:'eq', marker_cmp:'',
     delay_source:'fixed', delay_marker_id:'', delay_marker_unit:'s',
     weather_metric:'temperature', weather_op:'gt', weather_value:'25', weather_state:'rain',
-    weather_mode:'rise', weather_fire_start:false
+    weather_mode:'rise', weather_fire_start:false,
+    math_op:'add', math_const:'0', math_round:'', gate_output:'true'
   };
   if (type === 'marker') node.label = nextMarkerName();
   STATE.nodes.push(node);
@@ -1859,6 +2136,7 @@ function nodeSummary(n){
   if (n.type === 'condition') return condSummary(n);
   if (n.type === 'marker') return markerSummary(n);
   if (n.type === 'and' || n.type === 'or') return gateSummary(n);
+  if (n.type === 'math') return mathSummary(n);
   if (n.type === 'weather_in') return weatherTriggerSummary(n);
   return '';
 }
@@ -1909,20 +2187,6 @@ function renderNodes(){
         div.appendChild(lbl);
       });
     }
-    if (meta.dataIn){
-      const p = document.createElement('div');
-      p.className = 'port port-data-in'; p.dataset.node = n.id; p.dataset.port = 'data';
-      p.title = 'Eingänge: Ergebnisse von Bedingungen bzw. UND/ODER-Elementen';
-      p.onmouseup = (e) => finishConn(n.id, e, 'data');
-      div.appendChild(p);
-    }
-    if (meta.dataOut){
-      const p = document.createElement('div');
-      p.className = 'port port-data-out'; p.dataset.node = n.id; p.dataset.port = 'result';
-      p.title = 'Ergebnis (Ja/Nein) mit dem Eingang eines UND/ODER-Elements verbinden';
-      p.onmousedown = (e) => startConn(n.id, 'result', e);
-      div.appendChild(p);
-    }
     canvas.appendChild(div);
   });
 }
@@ -1932,8 +2196,6 @@ function nodePortPos(nodeId, port){
   if (!el) return {x:0,y:0};
   const w = el.offsetWidth, h = el.offsetHeight;
   const x = el.offsetLeft, y = el.offsetTop;
-  if (port === 'data') return {x: x + w*0.5, y: y};
-  if (port === 'result') return {x: x + w*0.75, y: y + h};
   if (port === 'in') return {x: x, y: y + h/2};
   if (port === 'true') return {x: x + w, y: y + h*0.34};
   if (port === 'false') return {x: x + w, y: y + h*0.66};
@@ -1967,21 +2229,51 @@ function markerReferences(){
   });
   return refs.filter(r => { const m = nodeById(r.marker); return m && m.type === 'marker'; });
 }
-function gateSummary(n){
-  const cnt = STATE.connections.filter(c => c.to === n.id && c.to_port === 'data').length;
-  const rule = n.type === 'and' ? 'Ja, wenn <b>alle</b> Eingänge Ja sind' : 'Ja, wenn <b>mindestens ein</b> Eingang Ja ist';
-  return `${rule}<br>Eingänge: <b>${cnt}</b>`;
+// Eingaenge eines Blocks = alle Linien, die in ihn fuehren (Reihenfolge = A, B, C ...)
+function inputConns(id){
+  return STATE.connections.filter(c => c.to === id && !c.trigger_only && nodeById(c.from));
 }
-function dataReaches(startId, targetId){
-  const seen = new Set(), stack = [startId];
-  while (stack.length){
-    const cur = stack.pop();
-    if (cur === targetId) return true;
-    if (seen.has(cur)) continue;
-    seen.add(cur);
-    STATE.connections.forEach(c => { if (c.to_port === 'data' && c.from === cur) stack.push(c.to); });
-  }
-  return false;
+function srcLabel(id){
+  const m = nodeById(id);
+  return m ? (m.label || NODE_META[m.type].title) : '?';
+}
+const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+function inputLetter(c){
+  const t = nodeById(c.to);
+  if (!t || !(t.type === 'math' || (t.type === 'condition' && t.cond_type === 'inputs'))) return '';
+  const ins = inputConns(t.id);
+  if (ins.length < 2) return '';
+  const i = ins.findIndex(x => x.id === c.id);
+  return i >= 0 ? LETTERS[i % 26] : '';
+}
+function inputsInfoHtml(id){
+  const ins = inputConns(id);
+  if (!ins.length) return 'Noch kein Eingang angeschlossen: einen Block mit dem Ausgang (rechter Punkt) auf den linken Punkt dieses Blocks ziehen.';
+  return 'Eingänge: ' + ins.map((c, i) => `<b>${LETTERS[i % 26]}</b> = ${escapeHtml(srcLabel(c.from))}`).join(' &nbsp; ');
+}
+function swapInputs(id){
+  const ins = inputConns(id);
+  if (ins.length < 2){ toast('Zum Tauschen werden mindestens zwei Eingänge gebraucht.', false); return; }
+  const i = STATE.connections.indexOf(ins[0]), j = STATE.connections.indexOf(ins[1]);
+  [STATE.connections[i], STATE.connections[j]] = [STATE.connections[j], STATE.connections[i]];
+  renderAll(); scheduleSave();
+}
+function gateSummary(n){
+  const cnt = inputConns(n.id).length;
+  const rule = n.type === 'and' ? 'Ja, wenn <b>alle</b> Eingänge Ja sind' : 'Ja, wenn <b>mindestens ein</b> Eingang Ja ist';
+  const out = n.gate_output === 'always' ? 'Ausgang: <b>immer</b> (1 / 0)' : 'Ausgang: <b>nur bei Ja</b>';
+  return `${rule}<br>Eingänge: <b>${cnt}</b><br>${out}`;
+}
+const MATH_SYM = { add:'+', sub:'−', mul:'×', div:'÷', mod:'mod', pow:'^' };
+function mathSummary(n){
+  const names = inputConns(n.id).map(c => escapeHtml(srcLabel(c.from)));
+  const op = n.math_op || 'add';
+  const c = escapeHtml(n.math_const || '0');
+  if (!names.length) return 'Keine Eingänge angeschlossen';
+  if (names.length === 1) names.push(c);
+  if (['min','max','avg'].includes(op))
+    return `${{min:'Minimum', max:'Maximum', avg:'Mittelwert'}[op]}(<b>${names.join('; ')}</b>)`;
+  return `<b>${names.join(` ${MATH_SYM[op] || op} `)}</b>`;
 }
 
 function renderConnections(){
@@ -2007,19 +2299,26 @@ function renderConnections(){
     svg.appendChild(path);
   });
 
-  // 2) Ablauflinien (durchgezogen) und Datenlinien zu UND/ODER (gestrichelt)
+  // 2) Linien: jede Linie traegt Ablauf und Wert (Eingang A, B, C ... bei Bedingung/Rechnen beschriftet)
   STATE.connections.forEach(c => {
     if (!nodeBox(c.from) || !nodeBox(c.to)) return;   // Element liegt auf einer anderen Seite
-    const isData = c.to_port === 'data';
     const p1 = nodePortPos(c.from, c.from_port || 'out');
-    const p2 = nodePortPos(c.to, isData ? 'data' : 'in');
+    const p2 = nodePortPos(c.to, 'in');
     const sel = c.id === selectedConnId;
-    const path = svgEl('path', { d: isData ? pathVertical(p1, p2, 1) : pathBetween(p1, p2), fill:'none',
-      stroke: sel ? '#ff9142' : (isData ? '#4cc9f0cc' : '#3ddc9799'), 'stroke-width': sel ? '2.5' : '2', 'data-key': 'c:' + c.id });
-    if (isData){ path.setAttribute('stroke-dasharray', '6,4'); path.setAttribute('marker-end', 'url(#arrowData)'); }
+    const path = svgEl('path', { d: pathBetween(p1, p2), fill:'none',
+      stroke: sel ? '#ff9142' : '#3ddc9799', 'stroke-width': sel ? '2.5' : '2', 'data-key': 'c:' + c.id });
+    if (c.trigger_only) path.setAttribute('stroke-dasharray', '2,5');   // alte Linie: nur Ausloeser
     path.style.pointerEvents = 'stroke';
     path.onclick = () => { selectedConnId = c.id; selectedIds.clear(); renderAll(); };
     svg.appendChild(path);
+    const letter = inputLetter(c);
+    if (letter){
+      const cnt = inputConns(c.to).length, idx = LETTERS.indexOf(letter);
+      const t = svgEl('text', { x: p2.x - 18, y: p2.y + 4 + (idx - (cnt - 1) / 2) * 13, fill:'#ffd166', 'font-size':'11',
+                                'font-family':'monospace', 'font-weight':'700' });
+      t.textContent = letter; t.style.pointerEvents = 'none';
+      svg.appendChild(t);
+    }
   });
 }
 
@@ -2161,25 +2460,19 @@ function drawTempLine(){
     svg.appendChild(el);
   }
   const a = {x:drawingConn.x1,y:drawingConn.y1}, b = {x:drawingConn.x2,y:drawingConn.y2};
-  el.setAttribute('d', drawingConn.fromPort === 'result' ? pathVertical(a, b) : pathBetween(a, b));
+  el.setAttribute('d', pathBetween(a, b));
 }
 function finishConn(targetId, e, toPort){
   e.stopPropagation();
   if (!drawingConn) return;
-  toPort = toPort || 'in';
-  const isDataLine = drawingConn.fromPort === 'result';
   const tmp = document.getElementById('tempConnLine');
   const abort = (msg) => { drawingConn = null; if (tmp) tmp.remove(); renderConnections(); if (msg) toast(msg, false); };
-  if (drawingConn.fromId === targetId) return abort();
-  if (isDataLine !== (toPort === 'data')) return abort(isDataLine
-    ? 'Ergebnis-Ausgänge (unten) lassen sich nur mit den Eingängen (oben) eines UND/ODER-Elements verbinden.'
-    : 'Ablauf-Ausgänge (rechts) lassen sich nur mit Ablauf-Eingängen (links) verbinden.');
-  if (isDataLine && dataReaches(targetId, drawingConn.fromId)) return abort('Diese Verbindung würde einen Kreis bilden.');
+  if (drawingConn.fromId === targetId) return abort('Ein Block kann nicht mit sich selbst verbunden werden.');
   const exists = STATE.connections.some(c => c.from === drawingConn.fromId && c.from_port === drawingConn.fromPort
-    && c.to === targetId && (c.to_port || 'in') === toPort);
+    && c.to === targetId);
   if (!exists){
     STATE.connections.push({ id:'conn_' + Math.random().toString(16).slice(2,10),
-      from: drawingConn.fromId, from_port: drawingConn.fromPort, to: targetId, to_port: toPort });
+      from: drawingConn.fromId, from_port: drawingConn.fromPort, to: targetId, to_port: 'in' });
     scheduleSave();
   }
   drawingConn = null;
@@ -2248,9 +2541,10 @@ function openNodeModal(id){
   document.getElementById('nodeError').style.display = 'none';
   document.getElementById('nodeModalTitle').textContent = NODE_META[n.type].title + ' bearbeiten';
   document.getElementById('n_label').value = n.label || '';
-  ['fields_mqtt_in','fields_mqtt_out','fields_delay','fields_condition','fields_marker','fields_and','fields_or','fields_weather_in'].forEach(id2 => {
+  ['fields_mqtt_in','fields_mqtt_out','fields_delay','fields_condition','fields_marker','fields_and','fields_or','fields_weather_in','fields_math'].forEach(id2 => {
     document.getElementById(id2).style.display = (id2 === 'fields_' + n.type) ? 'block' : 'none';
   });
+  document.getElementById('fields_gate_opts').style.display = (n.type === 'and' || n.type === 'or') ? 'block' : 'none';
   if (n.type === 'mqtt_in'){
     fillBrokerSelect(document.getElementById('in_broker'), n.broker_id);
     document.getElementById('in_topic').value = n.topic || '';
@@ -2269,6 +2563,10 @@ function openNodeModal(id){
     loadMarkerFields(n);
   } else if (n.type === 'weather_in'){
     loadWeatherTrigger(n);
+  } else if (n.type === 'and' || n.type === 'or'){
+    document.getElementById('gate_output').value = n.gate_output || 'true';
+  } else if (n.type === 'math'){
+    loadMathFields(n);
   }
   document.getElementById('nodeModal').classList.add('show');
 }
@@ -2301,6 +2599,10 @@ function submitNode(){
     if (!readMarkerFields(n, errEl, prevLabel)) return;
   } else if (n.type === 'weather_in'){
     if (!readWeatherTrigger(n, errEl)) return;
+  } else if (n.type === 'and' || n.type === 'or'){
+    n.gate_output = document.getElementById('gate_output').value;
+  } else if (n.type === 'math'){
+    if (!readMathFields(n, errEl)) return;
   }
   closeNodeModal();
   renderAll(); scheduleSave();
@@ -2354,12 +2656,20 @@ function condSummary(n){
     return `Merker <b>${nm}</b> ${OPS[n.marker_op] || '='} <b>${escapeHtml(n.marker_cmp || '-')}</b>`;
   }
   const lbl = OPS[n.operator] || escapeHtml(n.operator || '');
+  if (t === 'inputs'){
+    const ins = inputConns(n.id).map(c => escapeHtml(srcLabel(c.from)));
+    if (!ins.length) return 'Keine Eingänge angeschlossen';
+    if (n.operator === 'true') return `<b>${ins.join(' und ')}</b> ist wahr`;
+    if (n.operator === 'false') return `<b>${ins.join(' und ')}</b> ist falsch`;
+    if (ins.length === 1) ins.push(escapeHtml(n.compare_value || '-'));
+    return `<b>${ins.join(` ${OPS[n.operator] || '='} `)}</b>`;
+  }
   return `Wenn Wert ${lbl} <b>${escapeHtml(n.compare_value||'-')}</b>`;
 }
 
 function onCondTypeChange(){
   const t = document.getElementById('cond_type').value;
-  ['payload','time','sun','weekday','date','marker','weather'].forEach(k => {
+  ['inputs','payload','time','sun','weekday','date','marker','weather'].forEach(k => {
     document.getElementById('cond_' + k).style.display = (k === t) ? 'block' : 'none';
   });
   const tm = document.getElementById('time_mode').value;
@@ -2370,10 +2680,15 @@ function onCondTypeChange(){
   document.getElementById('date_from_lbl').textContent = (dm === 'between') ? 'Von' : 'Datum';
   const mop = document.getElementById('cond_m_op').value;
   document.getElementById('cond_m_value_wrap').style.display = (mop === 'true' || mop === 'false') ? 'none' : 'block';
+  const iop = document.getElementById('ci_op').value;
+  document.getElementById('ci_value_wrap').style.display = (iop === 'true' || iop === 'false') ? 'none' : 'block';
 }
 
 function loadCondFields(n){
   document.getElementById('cond_type').value = n.cond_type || 'payload';
+  document.getElementById('ci_op').value = n.operator || 'eq';
+  document.getElementById('ci_value').value = n.compare_value || '';
+  document.getElementById('ci_info').innerHTML = inputsInfoHtml(n.id);
   document.getElementById('cond_op').value = n.operator || 'eq';
   document.getElementById('cond_value').value = n.compare_value || '';
   document.getElementById('time_mode').value = n.time_mode || 'between';
@@ -2434,11 +2749,42 @@ function readCondFields(n, errEl){
     if (['gt','gte','lt','lte'].includes(op) && isNaN(parseFloat(val.replace(',', '.'))))
       return fail('Für Größer-/Kleiner-Vergleiche bitte eine Zahl angeben.');
     n.marker_id = mid; n.marker_op = op; n.marker_cmp = val;
+  } else if (t === 'inputs'){
+    const op = document.getElementById('ci_op').value;
+    const val = document.getElementById('ci_value').value;
+    if (['gt','gte','lt','lte'].includes(op) && inputConns(n.id).length < 2 && isNaN(parseFloat(val.replace(',', '.'))))
+      return fail('Für Größer-/Kleiner-Vergleiche mit nur einem Eingang bitte als Vergleichswert eine Zahl angeben.');
+    n.operator = op; n.compare_value = val;
   } else {
     n.operator = document.getElementById('cond_op').value;
     n.compare_value = document.getElementById('cond_value').value;
   }
   n.cond_type = t;
+  return true;
+}
+
+// ---------------- Rechnen ----------------
+function onMathChange(){
+  const op = document.getElementById('math_op').value;
+  const ins = inputConns(editingNodeId || '').length;
+  document.getElementById('math_info').innerHTML = inputsInfoHtml(editingNodeId)
+    + (ins === 1 ? ' &nbsp; <b>B</b> = Konstante' : '');
+}
+function loadMathFields(n){
+  document.getElementById('math_op').value = n.math_op || 'add';
+  document.getElementById('math_const').value = n.math_const ?? '0';
+  document.getElementById('math_round').value = n.math_round ?? '';
+  onMathChange();
+}
+function readMathFields(n, errEl){
+  const c = document.getElementById('math_const').value.trim();
+  const r = document.getElementById('math_round').value.trim();
+  if (c !== '' && isNaN(parseFloat(c.replace(',', '.')))){
+    errEl.textContent = 'Die Konstante muss eine Zahl sein.'; errEl.style.display = 'block'; return false;
+  }
+  n.math_op = document.getElementById('math_op').value;
+  n.math_const = c === '' ? '0' : c;
+  n.math_round = r;
   return true;
 }
 
@@ -2836,7 +3182,8 @@ async function playTrace(ev){
     touchTab(ev.to);
     await travel('c:' + ev.conn, '#ff9142', nodeTitle(ev.to), 650);
   } else if (ev.kind === 'data'){
-    await travel('c:' + ev.conn, ev.result ? '#3ddc97' : '#ff5d5d', ev.result ? 'Ja' : 'Nein', 450);
+    const col = (ev.result === null || ev.result === undefined) ? '#4cc9f0' : (ev.result ? '#3ddc97' : '#ff5d5d');
+    await travel('c:' + ev.conn, col, ev.label || (ev.result ? 'Ja' : 'Nein'), 450);
   } else if (ev.kind === 'ref'){
     await travel('r:' + ev.marker + '|' + ev.target, '#4cc9f0', 'Wert', 450);
   } else if (ev.kind === 'enter'){
